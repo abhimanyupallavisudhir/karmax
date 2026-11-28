@@ -13,7 +13,7 @@ tavya in its own window on your Mac or Linux computer: what's for you in the men
 | AppImage (any distribution) | [Download](/download/desktop/tavya-linux-x64.AppImage) | [Download](/download/desktop/tavya-linux-arm64.AppImage) |
 | .deb (Debian, Ubuntu) | [Download](/download/desktop/tavya-linux-x64.deb) | [Download](/download/desktop/tavya-linux-arm64.deb) |
 
-Make the AppImage executable (`chmod +x tavya-*.AppImage`) and open it; it needs FUSE 2 (`sudo apt install libfuse2t64` on Ubuntu 24.04, `libfuse2` before). Install the .deb with `sudo apt install ./tavya_*.deb`.
+Install the .deb with `sudo apt install ./tavya_*.deb`. On Ubuntu 24.04 and later prefer it to the AppImage: Ubuntu lets only installed apps use the sandbox Chromium protects web pages with, so the AppImage turns it off there. Make the AppImage executable (`chmod +x tavya-*.AppImage`) and open it; it needs FUSE 2 (`sudo apt install libfuse2t64`, or `libfuse2` before Ubuntu 24.04).
 
 ## Using it
 

@@ -35,6 +35,19 @@ const shot = async (name: string) => {
   fs.mkdirSync(SHOTS, { recursive: true });
   await page.screenshot({ path: path.join(SHOTS, `${name}.png`) });
 };
+/**
+ * Starts the app again, as a desktop launcher would: a second instance hands its link to the first and quits (exit 0).
+ * Chromium refuses to start without a usable sandbox, so this follows the shipped AppImage's rule (electron-builder's
+ * AppRun): `--no-sandbox` only where unprivileged user namespaces don't work (Ubuntu 24.04+ restricts them by AppArmor).
+ */
+const userNamespaces = spawnSync('unshare', ['-Ur', 'true']).status === 0;
+async function launchAgain(...args: string[]): Promise<{ code: number | null; signal: NodeJS.Signals | null; stderr: string }> {
+  const child = spawn(electronPath!, [...(userNamespaces ? [] : ['--no-sandbox']), DESKTOP, ...args], { env: env(), stdio: ['ignore', 'ignore', 'pipe'] });
+  let stderr = '';
+  child.stderr!.on('data', (chunk) => { stderr += chunk; });
+  const [code, signal] = await new Promise<[number | null, NodeJS.Signals | null]>((resolve) => child.on('exit', (...exit) => resolve(exit)));
+  return { code, signal, stderr: stderr.slice(-2000) };
+}
 /** What the system browser was asked to open (shell.openExternal, recorded in main). */
 const opened = () => app.evaluate(() => (globalThis as any).__opened as string[]);
 
@@ -111,14 +124,12 @@ describe.skipIf(!runnable)('the desktop app', () => {
       await page.evaluate(() => { (globalThis as any).__opens = []; });
     }
     // A link opened elsewhere starts a second instance, which hands it over and quits.
-    const second = spawn(electronPath!, [DESKTOP, 'io.tavya.app://open?path=/acme/tasks/12'], { env: env(), stdio: 'ignore' });
-    const code = await new Promise<number | null>((resolve) => second.on('exit', resolve));
-    expect(code).toBe(0);
+    const second = await launchAgain('io.tavya.app://open?path=/acme/tasks/12');
+    expect(second.code, `the second instance ended with ${second.code ?? second.signal}:\n${second.stderr}`).toBe(0);
     await expect.poll(() => page.evaluate(() => (globalThis as any).__opens))
       .toEqual([{ path: '/acme/tasks/12', url: 'io.tavya.app://open?path=/acme/tasks/12', ask: false }]);
     // A link that leaves the console is refused.
-    const evil = spawn(electronPath!, [DESKTOP, 'io.tavya.app://open?path=//evil.example/x'], { env: env(), stdio: 'ignore' });
-    await new Promise((resolve) => evil.on('exit', resolve));
+    expect((await launchAgain('io.tavya.app://open?path=//evil.example/x')).code).toBe(0);
     await page.waitForTimeout(300);
     expect(await page.evaluate(() => (globalThis as any).__opens)).toHaveLength(1);
   });
@@ -126,8 +137,8 @@ describe.skipIf(!runnable)('the desktop app', () => {
   it('keeps running in the tray when the window is closed, and a second launch shows it again', async () => {
     await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.close());
     expect(await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map((shown: any) => shown.isVisible()))).toEqual([false]);
-    const second = spawn(electronPath!, [DESKTOP], { env: env(), stdio: 'ignore' });
-    await new Promise((resolve) => second.on('exit', resolve));
+    const second = await launchAgain();
+    expect(second.code, `the second instance ended with ${second.code ?? second.signal}:\n${second.stderr}`).toBe(0);
     await expect.poll(() => app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows()[0]!.isVisible())).toBe(true);
   });
 

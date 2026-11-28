@@ -103,14 +103,22 @@ jobs:
       # The end-to-end test boots a real gateway from the repository's own code.
       - name: Install the server (for the end-to-end test)
         run: npm ci --no-audit --no-fund && npm rebuild node-pty
-      # The runner has Chrome's libraries (Electron needs the same); add a display and a key presser.
+      # The runner has Chrome's libraries (Electron needs the same); add a display, a key presser and FUSE 2 (AppImages).
       - name: Display
-        run: sudo apt-get update -q && sudo apt-get install -y -q xvfb xdotool
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q xvfb xdotool
+          sudo apt-get install -y -q libfuse2t64 || sudo apt-get install -y -q libfuse2
       - name: The app, end to end (Xvfb, against a local gateway)
         run: xvfb-run -a npx vitest run tests/desktop-app.electron.test.ts
       - name: Build AppImage and .deb (x64, arm64)
         working-directory: desktop
         run: npm run dist:linux
+      # This Ubuntu restricts unprivileged user namespaces (AppArmor), as 24.04+ does
+      # for the people who download it: the AppImage must still start.
+      - name: The AppImage starts here, and a second launch hands over its link
+        working-directory: desktop
+        run: xvfb-run -a scripts/smoke-appimage.sh dist/*-x86_64.AppImage
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tavya-desktop-linux

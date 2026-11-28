@@ -74,6 +74,9 @@ module.exports = {
     target: [{ target: 'AppImage', arch: ['x64', 'arm64'] }, { target: 'deb', arch: ['x64', 'arm64'] }],
     icon: 'build/icons',
     executableName: 'tavya',
+    // The installed entry is named after package.json's desktopName (tavya.desktop), which is also the
+    // window's app_id / WM_CLASS, so docks and task bars group the window with its entry and icon.
+    syncDesktopName: true,
     category: 'Office',
     synopsis: 'Do anything with agents',
     description: 'tavya in its own window: a tray with what is for you, a global Ask shortcut and notifications.',
