@@ -7,13 +7,11 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		7A5A00000000000000000002 /* TavyaSignInPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A5A00000000000000000001 /* TavyaSignInPlugin.swift */; };
-		7A5A00000000000000000004 /* SpeechRecognitionPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A5A00000000000000000003 /* SpeechRecognitionPlugin.swift */; };
-		7A5A00000000000000000006 /* TavyaBridgeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A5A00000000000000000005 /* TavyaBridgeViewController.swift */; };
-		7A5A00000000000000000009 /* Firebase in Resources */ = {isa = PBXBuildFile; fileRef = 7A5A00000000000000000008 /* Firebase */; };
-		7A5A0000000000000000000C /* FirebaseCore in Frameworks */ = {isa = PBXBuildFile; productRef = 7A5A0000000000000000000B /* FirebaseCore */; };
-		7A5A0000000000000000000E /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = 7A5A0000000000000000000D /* FirebaseMessaging */; };
+		156F859504DDCEB6E3C7A968 /* TavyaIntents.swift in Sources */ = {isa = PBXBuildFile; fileRef = 63E3A96AE0E67887D83847BA /* TavyaIntents.swift */; };
+		236C8A1E9E276AFC3631B009 /* ShareViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = CCDAB9991AF55BC21964C7A0 /* ShareViewController.swift */; };
 		2FAD9763203C412B000D30F8 /* config.xml in Resources */ = {isa = PBXBuildFile; fileRef = 2FAD9762203C412B000D30F8 /* config.xml */; };
+		3E273E4E72E9DF047BA63AC8 /* TavyaShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED616E53B6517B6DC4DC9580 /* TavyaShared.swift */; };
+		4CD996854F365ADDBA046FDE /* TavyaPhonePlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = AAE980FF4D860CA365A6525F /* TavyaPhonePlugin.swift */; };
 		4D22ABE92AF431CB00220026 /* CapApp-SPM in Frameworks */ = {isa = PBXBuildFile; productRef = 4D22ABE82AF431CB00220026 /* CapApp-SPM */; };
 		50379B232058CBB4000EE86E /* capacitor.config.json in Resources */ = {isa = PBXBuildFile; fileRef = 50379B222058CBB4000EE86E /* capacitor.config.json */; };
 		504EC3081FED79650016851F /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 504EC3071FED79650016851F /* AppDelegate.swift */; };
@@ -21,16 +19,48 @@
 		504EC30F1FED79650016851F /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 504EC30E1FED79650016851F /* Assets.xcassets */; };
 		504EC3121FED79650016851F /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 504EC3101FED79650016851F /* LaunchScreen.storyboard */; };
 		50B271D11FEDC1A000F3C39B /* public in Resources */ = {isa = PBXBuildFile; fileRef = 50B271D01FEDC1A000F3C39B /* public */; };
+		74B1DD88FA044F63D532FB09 /* ShareExtension.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = 688CA786E81EAF2196FFED51 /* ShareExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
+		7A5A00000000000000000002 /* TavyaSignInPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A5A00000000000000000001 /* TavyaSignInPlugin.swift */; };
+		7A5A00000000000000000004 /* SpeechRecognitionPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A5A00000000000000000003 /* SpeechRecognitionPlugin.swift */; };
+		7A5A00000000000000000006 /* TavyaBridgeViewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7A5A00000000000000000005 /* TavyaBridgeViewController.swift */; };
+		7A5A00000000000000000009 /* Firebase in Resources */ = {isa = PBXBuildFile; fileRef = 7A5A00000000000000000008 /* Firebase */; };
+		7A5A0000000000000000000C /* FirebaseCore in Frameworks */ = {isa = PBXBuildFile; productRef = 7A5A0000000000000000000B /* FirebaseCore */; };
+		7A5A0000000000000000000E /* FirebaseMessaging in Frameworks */ = {isa = PBXBuildFile; productRef = 7A5A0000000000000000000D /* FirebaseMessaging */; };
+		918A5267EA74C1936A89A8EC /* DeviceToken.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8293428E179B59A307C9B391 /* DeviceToken.swift */; };
 		9582B6832FE993A70072D4E8 /* SceneDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9582B6822FE993A50072D4E8 /* SceneDelegate.swift */; };
+		A980C983962473D440A4E0F6 /* TavyaShared.swift in Sources */ = {isa = PBXBuildFile; fileRef = ED616E53B6517B6DC4DC9580 /* TavyaShared.swift */; };
+		B1A20F8A35C2466C40E8CD21 /* Foundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1EF58EB0998D5F1BAE377033 /* Foundation.framework */; };
+		EBE6FD06648CA0A946F565E4 /* TavyaServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 84878673431CE7BAED6878F6 /* TavyaServer.swift */; };
 /* End PBXBuildFile section */
 
+/* Begin PBXContainerItemProxy section */
+		18ED79671CFF9C99DB8D91E9 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 504EC2FC1FED79650016851F /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 32520F2A65828F6D9A2CD7A1;
+			remoteInfo = ShareExtension;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		F1316506DED37D8A56DEDC5B /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				74B1DD88FA044F63D532FB09 /* ShareExtension.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
 /* Begin PBXFileReference section */
-		7A5A00000000000000000001 /* TavyaSignInPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TavyaSignInPlugin.swift; sourceTree = "<group>"; };
-		7A5A00000000000000000003 /* SpeechRecognitionPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechRecognitionPlugin.swift; sourceTree = "<group>"; };
-		7A5A00000000000000000005 /* TavyaBridgeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TavyaBridgeViewController.swift; sourceTree = "<group>"; };
-		7A5A00000000000000000007 /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
-		7A5A00000000000000000008 /* Firebase */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Firebase; sourceTree = "<group>"; };
+		1EF58EB0998D5F1BAE377033 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/iPhoneOS.platform/Developer/SDKs/iPhoneOS26.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
 		2FAD9762203C412B000D30F8 /* config.xml */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = config.xml; sourceTree = "<group>"; };
+		4838C71C186BB2135CC15E21 /* ShareExtension.entitlements */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.entitlements; path = ShareExtension.entitlements; sourceTree = "<group>"; };
 		50379B222058CBB4000EE86E /* capacitor.config.json */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.json; path = capacitor.config.json; sourceTree = "<group>"; };
 		504EC3041FED79650016851F /* App.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = App.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		504EC3071FED79650016851F /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
@@ -39,8 +69,21 @@
 		504EC3111FED79650016851F /* Base */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; name = Base; path = Base.lproj/LaunchScreen.storyboard; sourceTree = "<group>"; };
 		504EC3131FED79650016851F /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		50B271D01FEDC1A000F3C39B /* public */ = {isa = PBXFileReference; lastKnownFileType = folder; path = public; sourceTree = "<group>"; };
+		63E3A96AE0E67887D83847BA /* TavyaIntents.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TavyaIntents.swift; sourceTree = "<group>"; };
+		688CA786E81EAF2196FFED51 /* ShareExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = ShareExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
+		7A5A00000000000000000001 /* TavyaSignInPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TavyaSignInPlugin.swift; sourceTree = "<group>"; };
+		7A5A00000000000000000003 /* SpeechRecognitionPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpeechRecognitionPlugin.swift; sourceTree = "<group>"; };
+		7A5A00000000000000000005 /* TavyaBridgeViewController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TavyaBridgeViewController.swift; sourceTree = "<group>"; };
+		7A5A00000000000000000007 /* App.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = App.entitlements; sourceTree = "<group>"; };
+		7A5A00000000000000000008 /* Firebase */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Firebase; sourceTree = "<group>"; };
+		8293428E179B59A307C9B391 /* DeviceToken.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = DeviceToken.swift; sourceTree = "<group>"; };
+		84878673431CE7BAED6878F6 /* TavyaServer.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TavyaServer.swift; sourceTree = "<group>"; };
 		9582B6822FE993A50072D4E8 /* SceneDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneDelegate.swift; sourceTree = "<group>"; };
 		958DCC722DB07C7200EA8C5F /* debug.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = debug.xcconfig; path = ../debug.xcconfig; sourceTree = SOURCE_ROOT; };
+		A69D6952493A3887DA14E25A /* Info.plist */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		AAE980FF4D860CA365A6525F /* TavyaPhonePlugin.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TavyaPhonePlugin.swift; sourceTree = "<group>"; };
+		CCDAB9991AF55BC21964C7A0 /* ShareViewController.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = ShareViewController.swift; sourceTree = "<group>"; };
+		ED616E53B6517B6DC4DC9580 /* TavyaShared.swift */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = sourcecode.swift; path = TavyaShared.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -54,15 +97,42 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		8819B195CE51D10E730C592A /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				B1A20F8A35C2466C40E8CD21 /* Foundation.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		1A1BB0E3F1D5EE4EAEAD4A02 /* iOS */ = {
+			isa = PBXGroup;
+			children = (
+				1EF58EB0998D5F1BAE377033 /* Foundation.framework */,
+			);
+			name = iOS;
+			sourceTree = "<group>";
+		};
+		3547D441C64562CABF7F79AD /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				1A1BB0E3F1D5EE4EAEAD4A02 /* iOS */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		504EC2FB1FED79650016851F = {
 			isa = PBXGroup;
 			children = (
 				958DCC722DB07C7200EA8C5F /* debug.xcconfig */,
 				504EC3061FED79650016851F /* App */,
 				504EC3051FED79650016851F /* Products */,
+				B3681A0D44605D20A0171C82 /* Shared */,
+				3547D441C64562CABF7F79AD /* Frameworks */,
+				D320B477EEC628DE9B06BE36 /* ShareExtension */,
 			);
 			sourceTree = "<group>";
 		};
@@ -70,6 +140,7 @@
 			isa = PBXGroup;
 			children = (
 				504EC3041FED79650016851F /* App.app */,
+				688CA786E81EAF2196FFED51 /* ShareExtension.appex */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -91,13 +162,54 @@
 				2FAD9762203C412B000D30F8 /* config.xml */,
 				50B271D01FEDC1A000F3C39B /* public */,
 				7A5A00000000000000000008 /* Firebase */,
+				AAE980FF4D860CA365A6525F /* TavyaPhonePlugin.swift */,
+				84878673431CE7BAED6878F6 /* TavyaServer.swift */,
+				63E3A96AE0E67887D83847BA /* TavyaIntents.swift */,
 			);
 			path = App;
+			sourceTree = "<group>";
+		};
+		B3681A0D44605D20A0171C82 /* Shared */ = {
+			isa = PBXGroup;
+			children = (
+				ED616E53B6517B6DC4DC9580 /* TavyaShared.swift */,
+				8293428E179B59A307C9B391 /* DeviceToken.swift */,
+			);
+			name = Shared;
+			path = Shared;
+			sourceTree = "<group>";
+		};
+		D320B477EEC628DE9B06BE36 /* ShareExtension */ = {
+			isa = PBXGroup;
+			children = (
+				CCDAB9991AF55BC21964C7A0 /* ShareViewController.swift */,
+				A69D6952493A3887DA14E25A /* Info.plist */,
+				4838C71C186BB2135CC15E21 /* ShareExtension.entitlements */,
+			);
+			name = ShareExtension;
+			path = ShareExtension;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		32520F2A65828F6D9A2CD7A1 /* ShareExtension */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 075E5B1AEDD7D01D4CA94C3B /* Build configuration list for PBXNativeTarget "ShareExtension" */;
+			buildPhases = (
+				A37F67E055C0C967044E4C86 /* Sources */,
+				8819B195CE51D10E730C592A /* Frameworks */,
+				AC6383599E218663F8863095 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = ShareExtension;
+			productName = ShareExtension;
+			productReference = 688CA786E81EAF2196FFED51 /* ShareExtension.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 		504EC3031FED79650016851F /* App */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 504EC3161FED79650016851F /* Build configuration list for PBXNativeTarget "App" */;
@@ -105,10 +217,12 @@
 				504EC3001FED79650016851F /* Sources */,
 				504EC3011FED79650016851F /* Frameworks */,
 				504EC3021FED79650016851F /* Resources */,
+				F1316506DED37D8A56DEDC5B /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				44087624816BC5BC7A7AE9F1 /* PBXTargetDependency */,
 			);
 			name = App;
 			packageProductDependencies = (
@@ -154,6 +268,7 @@
 			projectRoot = "";
 			targets = (
 				504EC3031FED79650016851F /* App */,
+				32520F2A65828F6D9A2CD7A1 /* ShareExtension */,
 			);
 		};
 /* End PBXProject section */
@@ -173,6 +288,13 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		AC6383599E218663F8863095 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -185,10 +307,33 @@
 				7A5A00000000000000000006 /* TavyaBridgeViewController.swift in Sources */,
 				7A5A00000000000000000002 /* TavyaSignInPlugin.swift in Sources */,
 				7A5A00000000000000000004 /* SpeechRecognitionPlugin.swift in Sources */,
+				4CD996854F365ADDBA046FDE /* TavyaPhonePlugin.swift in Sources */,
+				EBE6FD06648CA0A946F565E4 /* TavyaServer.swift in Sources */,
+				156F859504DDCEB6E3C7A968 /* TavyaIntents.swift in Sources */,
+				3E273E4E72E9DF047BA63AC8 /* TavyaShared.swift in Sources */,
+				918A5267EA74C1936A89A8EC /* DeviceToken.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A37F67E055C0C967044E4C86 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				236C8A1E9E276AFC3631B009 /* ShareViewController.swift in Sources */,
+				A980C983962473D440A4E0F6 /* TavyaShared.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		44087624816BC5BC7A7AE9F1 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			name = ShareExtension;
+			target = 32520F2A65828F6D9A2CD7A1 /* ShareExtension */;
+			targetProxy = 18ED79671CFF9C99DB8D91E9 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin PBXVariantGroup section */
 		504EC30B1FED79650016851F /* Main.storyboard */ = {
@@ -210,6 +355,33 @@
 /* End PBXVariantGroup section */
 
 /* Begin XCBuildConfiguration section */
+		094BCF097FCD407E30FA5BCE /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.tavya.app.share;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+			};
+			name = Debug;
+		};
 		504EC3141FED79650016851F /* Debug */ = {
 			isa = XCBuildConfiguration;
 			baseConfigurationReference = 958DCC722DB07C7200EA8C5F /* debug.xcconfig */;
@@ -365,9 +537,46 @@
 			};
 			name = Release;
 		};
+		89AE45417DEE7600139212D9 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CLANG_ENABLE_OBJC_WEAK = NO;
+				CODE_SIGN_ENTITLEMENTS = ShareExtension/ShareExtension.entitlements;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 1;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = ShareExtension/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.0.0;
+				PRODUCT_BUNDLE_IDENTIFIER = io.tavya.app.share;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "";
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALIDATE_PRODUCT = YES;
+			};
+			name = Release;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		075E5B1AEDD7D01D4CA94C3B /* Build configuration list for PBXNativeTarget "ShareExtension" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				89AE45417DEE7600139212D9 /* Release */,
+				094BCF097FCD407E30FA5BCE /* Debug */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		504EC2FF1FED79650016851F /* Build configuration list for PBXProject "App" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
@@ -407,6 +616,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		4D22ABE82AF431CB00220026 /* CapApp-SPM */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */;
+			productName = "CapApp-SPM";
+		};
 		7A5A0000000000000000000B /* FirebaseCore */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 7A5A0000000000000000000A /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
@@ -416,11 +630,6 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 7A5A0000000000000000000A /* XCRemoteSwiftPackageReference "firebase-ios-sdk" */;
 			productName = FirebaseMessaging;
-		};
-		4D22ABE82AF431CB00220026 /* CapApp-SPM */ = {
-			isa = XCSwiftPackageProductDependency;
-			package = D4C12C0A2AAA248700AAC8A2 /* XCLocalSwiftPackageReference "CapApp-SPM" */;
-			productName = "CapApp-SPM";
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

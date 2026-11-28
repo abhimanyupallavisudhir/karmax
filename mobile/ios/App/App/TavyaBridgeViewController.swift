@@ -8,5 +8,8 @@ class TavyaBridgeViewController: CAPBridgeViewController {
     override func capacitorDidLoad() {
         bridge?.registerPluginInstance(TavyaSignInPlugin())
         bridge?.registerPluginInstance(SpeechRecognitionPlugin())
+        bridge?.registerPluginInstance(TavyaPhonePlugin())
+        // Links an App Intent made while the app was starting.
+        TavyaLinks.bridgeReady()
     }
 }

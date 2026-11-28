@@ -6,5 +6,16 @@
 	     exports with "production"; development builds use the sandbox. -->
 	<key>aps-environment</key>
 	<string>development</string>
+	<!-- Universal links to the console (tavya.io serves apple-app-site-association
+	     from Installation → Phone apps → Links; wiki features/phone-apps). -->
+	<key>com.apple.developer.associated-domains</key>
+	<array>
+		<string>applinks:tavya.io</string>
+	</array>
+	<!-- Shared with the Share Extension: what was shared, and the device token's Keychain item and lock. -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>group.io.tavya.app</string>
+	</array>
 </dict>
 </plist>

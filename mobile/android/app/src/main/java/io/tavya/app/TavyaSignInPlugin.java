@@ -75,6 +75,34 @@ public class TavyaSignInPlugin extends Plugin {
         });
     }
 
+    /**
+     * The device token for native surfaces (wiki planned/native-apps-round-2
+     * § contracts 3): kept encrypted with a Keystore key (DeviceToken), used
+     * only by TavyaServer, never handed back to the page.
+     */
+    @PluginMethod
+    public void saveDeviceToken(PluginCall call) {
+        String token = call.getString("token");
+        if (token == null || !token.startsWith("tvr_")) {
+            call.reject("token must be a device token", "invalid");
+            return;
+        }
+        try {
+            DeviceToken.save(getContext(), token);
+            TavyaServer.of(getContext()).forget();
+            call.resolve();
+        } catch (RuntimeException e) {
+            call.reject(e.getMessage(), "unavailable");
+        }
+    }
+
+    @PluginMethod
+    public void clearDeviceToken(PluginCall call) {
+        DeviceToken.clear(getContext());
+        TavyaServer.of(getContext()).forget();
+        call.resolve();
+    }
+
     @Override
     protected void handleOnNewIntent(Intent intent) {
         super.handleOnNewIntent(intent);

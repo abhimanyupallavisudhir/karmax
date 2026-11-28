@@ -4429,11 +4429,15 @@ function wireAttachmentPicker(input, getImages, getFiles, onChange, projectOf = 
     event.preventDefault();
     input.click();
   });
+  // Files from outside the page (Share to tavya) take the same way as picked ones.
+  input._attach = (selected) => {
+    for (const file of selected)
+      attachToPrompt(file, { images: getImages(), files: getFiles(), onChange, projectId: projectOf(), fromClipboard: false });
+  };
   input.addEventListener('change', () => {
     const selected = [...(input.files || [])];
     input.value = '';
-    for (const file of selected)
-      attachToPrompt(file, { images: getImages(), files: getFiles(), onChange, projectId: projectOf(), fromClipboard: false });
+    input._attach(selected);
   });
 }
 
@@ -5225,6 +5229,7 @@ async function boot() {
   if (S.justVerified) { toast('✓ Email confirmed', false); S.justVerified = false; }
   installShellListeners();
   await applyRoute(); // honor the initial URL (deep link / bookmark)
+  markConsoleReady();
   if (S.inviteWelcome) { toast(`Welcome to ${organizationById(S.inviteWelcome)?.name || 'the team'}`); S.inviteWelcome = null; }
 }
 
@@ -9242,7 +9247,13 @@ function newTaskTarget() { return S.tab === 'home' ? newTaskProjectId() : S.proj
 // project, acting with your own authority (one conversation is one task), or
 // its CEO (the first Ask starts it). Its page opens with the message box ready.
 // Someone whose authority covers only some projects asks in one of those.
-function askTavya() {
+// `listen`: dictation starts at once (the phone's assistant gesture, the tile, the widget's mic).
+function askTavya({ listen = false } = {}) {
+  // Opened again (a second gesture while it is open): the open one stays.
+  if (document.querySelector('dialog.ask-dialog[open]')) {
+    if (listen && S.dictation?.key !== 'ask') toggleDictation('ask');
+    return;
+  }
   const organizationId = S.organizationId;
   const previousFocus = document.activeElement;
   const dialog = document.createElement('dialog');
@@ -9302,6 +9313,7 @@ function askTavya() {
   document.body.appendChild(dialog);
   dialog.showModal();
   input.focus();
+  if (listen) toggleDictation('ask');
 }
 /** Focus what a page is about to render (a task page's message box). */
 function focusWhenReady(selector, deadline = Date.now() + 8000) {
@@ -10460,6 +10472,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
           </nav>` : ''}
           <div class="tf-head-end">
             <span class="tf-savestate save-state quiet" id="tf-savestate" role="status"></span>
+            ${opts?.share ? '<button type="button" class="btn sm" id="tf-add-to-task" title="Send it to one of your tasks instead">Add to task…</button>' : ''}
             ${templatePickable ? `<button type="button" class="tf-template" id="tf-template" title="Start from a template" aria-label="Template${opts?.template ? `: ${esc(opts.template.name)}` : ''}">${ICON.template}${opts?.template ? `<span class="tf-template-label">${esc(opts.template.name)}</span>` : ''}</button>` : ''}
           </div>
         </div>
@@ -10546,15 +10559,35 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
       removeDeletedTaskLocally(autoSaved);
     }
     // Attachments are uploaded into a project; they cannot follow the task elsewhere.
-    if (hadAttachments) toast('Attachments removed — attach them again for this project');
+    // What was shared to the app is attached again there.
+    const shared = opts?.share?.files?.length || 0;
+    if (hadAttachments && formImages.length + formFiles.length > shared) toast('Attachments removed — attach them again for this project');
     if (store) {
       // Its route is that project's: whether it is installed there, and where Back goes.
       root.innerHTML = '';
       carriedStoreForm = { projectId: nextProjectId, id: store.id, params: storeParams };
       return go(storeTaskRoute(nextProjectId, store.id), { replace: true });
     }
-    openTaskForm(wf, undefined, carried.trim(), undefined, { projectId: nextProjectId });
+    openTaskForm(wf, undefined, carried.trim(), undefined, { projectId: nextProjectId,
+      ...(opts?.share ? { share: { ...opts.share, text: carried.trim() } } : {}) });
   });
+  // Add to task…: what was shared goes to a task's message box instead; the draft made here goes.
+  $('#tf-add-to-task')?.addEventListener('click', () => chooseTaskForShare(async (task) => {
+    const promptName = consumingField(fields)?.name;
+    const text = (promptName ? $('#tf-body')?.querySelector(`[data-field="${CSS.escape(promptName)}"]`)?.value || '' : '').trim();
+    clearTimeout(saveTimer);
+    releaseFormKeys();
+    await saveChain;
+    if (draftId) {
+      const autoSaved = draftId;
+      draftId = null;
+      await api(`/api/tasks/${autoSaved}`, { method: 'DELETE' }).catch(() => {});
+      removeDeletedTaskLocally(autoSaved);
+    }
+    root.innerHTML = '';
+    if (activeFormToken === formToken) activeFormToken = null;
+    await addShareToTask(task, { text, files: opts.share.files || [] });
+  }));
   // Another template: the form starts over from it, keeping what you wrote
   // (an untouched prompt is the old template's, so the new one's replaces it)
   // and your attachments. The draft auto-saved here gives way to the new form.
@@ -11319,6 +11352,8 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
     else closeForm();
   };
   document.addEventListener('keydown', taskFormKeydown, { capture: true, signal: formKeyController.signal });
+  // Shared to the app (Share to tavya): its files upload like picked ones, once the form is whole.
+  if (opts?.share?.files?.length) $('#tf-files')?._attach?.(opts.share.files);
 }
 
 // ── task page ─────────────────────────────────────────────────────────────────
@@ -27952,11 +27987,22 @@ function showDesktopPush(push) {
 async function forgetAppIdentity() {
   await nativePlugin('TavyaSignIn')?.clearDeviceToken?.().catch(() => {});
   syncAppBadge(0);
+  // The widget and Siri say "Sign in" until the app is signed in again.
+  await nativePlugin('TavyaPhone')?.setContext({ organizationId: null, forMe: 0 }).catch(() => {});
+  phoneContextShown = null;
 }
 
-// The For-me count on the app's icon (the dock badge, the tray's title).
-let appBadgeShown = null;
+// The For-me count on the app's icon (the dock badge, the tray's title), and
+// what the phone shows outside the app: the Android widget's count, and the
+// organization Siri asks in and reads For me from (TavyaPhone.setContext).
+let appBadgeShown = null, phoneContextShown = null;
 function syncAppBadge(count) {
+  const phone = S.user && nativePlugin('TavyaPhone');
+  const context = { organizationId: S.organizationId || null, forMe: count };
+  if (phone && JSON.stringify(context) !== phoneContextShown) {
+    phoneContextShown = JSON.stringify(context);
+    phone.setContext(context).catch(() => {});
+  }
   const shell = desktopShell();
   if (!shell || count === appBadgeShown) return;
   appBadgeShown = count;
@@ -27967,31 +28013,130 @@ function forMeTotal() {
 }
 
 // A link into the console from outside it: io.tavya.app://open?path=/… (any
-// shell), the desktop tray's items and its Ask hotkey ({ask: true}). Only a
-// path of this console opens.
+// shell), a verified https link to this console (App Links, universal links),
+// the desktop tray's items and its Ask hotkey ({ask: true}). Only a path of
+// this console opens. The phones' OS entry points (wiki features/phone-apps
+// § Entry points) arrive as links too, so a cold start or a signed-out app
+// handles them once it is signed in (Capacitor's App plugin keeps them):
+// io.tavya.app://ask[?voice=1] (Siri, the assistant gesture, the tile, the
+// widget's mic), io.tavya.app://new, io.tavya.app://for-me (the widget's
+// count) and io.tavya.app://share (Share to tavya).
 function openAppLink({ url, path, ask } = {}) {
   if (ask) return askTavya();
   let target = typeof path === 'string' ? path : '';
   try {
     const link = url ? new URL(url) : null;
-    if (link?.protocol === 'io.tavya.app:' && link.host === 'open') target = link.searchParams.get('path') || '/';
-    else if (link && link.origin === location.origin) target = `${link.pathname}${link.search}${link.hash}`;
+    if (link?.protocol === 'io.tavya.app:') {
+      if (link.host === 'ask') return askTavya({ listen: link.searchParams.get('voice') === '1' });
+      if (link.host === 'new') return openNewTaskForm();
+      if (link.host === 'for-me') return spaNavigate(homeRoute(currentOrg(), DEFAULT_LIST_QUERY));
+      if (link.host === 'share') return receiveShare();
+      if (link.host === 'open') target = link.searchParams.get('path') || '/';
+    } else if (link && link.origin === location.origin) target = `${link.pathname}${link.search}${link.hash}`;
   } catch { return; }
   if (!target.startsWith('/') || target.startsWith('//') || target.startsWith('/\\')) return;
   openPushedUrl(target);
+}
+
+// Share to tavya (Android's share sheet, the iOS Share Extension): the shell
+// keeps what was shared until the console takes it, then it opens the new
+// task form with the text in the prompt and the files attached through the
+// form's own upload — or, with Add to task…, a recent task's message box. The
+// bytes cross the bridge in chunks (base64), so a large file never sits in one
+// message. Files past the prompt's limits are left out, said so.
+const SHARE_CHUNK_BYTES = 512 * 1024;
+const SHARE_FILE_LIMIT_BYTES = 50 * 1024 * 1024;
+let shareTaking = null;
+function receiveShare() {
+  const phone = nativePlugin('TavyaPhone');
+  if (!phone) return null;
+  shareTaking ||= (async () => {
+    const { share } = (await phone.takeShare()) || {};
+    if (!share) return;
+    const files = [];
+    try {
+      for (const [index, entry] of (share.files || []).entries()) {
+        if (Number(entry.size) > SHARE_FILE_LIMIT_BYTES) { toast(`${entry.name || 'A file'} is too large to attach`, true); continue; }
+        files.push(await readSharedFile(phone, share.id, index, entry));
+      }
+    } finally { await phone.finishShare({ id: share.id }).catch(() => {}); }
+    await openSharedTaskForm({ text: String(share.text || '').trim(), files });
+  })().catch((error) => toast(plainError(error), true)).finally(() => { shareTaking = null; });
+  return shareTaking;
+}
+async function readSharedFile(phone, id, index, entry) {
+  const parts = [];
+  for (let offset = 0, total = 0; total <= SHARE_FILE_LIMIT_BYTES;) {
+    const { data, eof } = await phone.readShareFile({ id, index, offset, length: SHARE_CHUNK_BYTES });
+    const bytes = Uint8Array.from(atob(data || ''), (c) => c.charCodeAt(0));
+    parts.push(bytes);
+    offset += bytes.length; total += bytes.length;
+    if (eof || !bytes.length) break;
+  }
+  return new File(parts, entry.name || 'shared', { type: entry.type || 'application/octet-stream' });
+}
+// The new task form in the project a new task goes to, holding what was shared.
+function openSharedTaskForm(share, projectId = newTaskProjectId()) {
+  if (!projectId) return withNewTaskProject((chosen) => openSharedTaskForm(share, chosen));
+  return openTaskForm(NEW_TASK_WORKFLOW, undefined, share.text, undefined, { projectId, share });
+}
+// Add to task…: the organization's recently updated tasks; the chosen one's
+// page opens with the shared text and files in its message box, ready to send.
+function chooseTaskForShare(onPick) {
+  const organizationId = S.organizationId;
+  const entries = (tasks) => tasks.map((task, i) => ({ n: i + 1, name: task.title || `#${task.num}`,
+    sub: projectById(task.projectId)?.name || '', search: `${task.title || ''} ${task.num ?? ''}`, task }));
+  const picker = openNumberedPicker({ id: 'share-task', label: 'Add to task', placeholder: 'Add to task…',
+    inputLabel: 'Task title or number', empty: 'No such task', entries: [], loading: true, pick: (entry) => onPick(entry.task) });
+  api(`/api/organizations/${encodeURIComponent(organizationId)}/search?q=${encodeURIComponent('-is:archived -is:draft -is:series sort:updated-desc')}&limit=9`)
+    .then((result) => picker.setEntries(entries((result?.tasks || []).filter((task) => task.projectId))))
+    .catch((error) => { picker.close(); toast(plainError(error), true); });
+}
+async function addShareToTask(task, { text, files }) {
+  await spaNavigate(`${projectBase(task.projectId)}/tasks/${task.num ?? task.id}`);
+  const box = await whenOnPage('.followup-box');
+  const input = box?.querySelector('.followup-input');
+  if (!input) return toast('This task takes no messages now', true);
+  if (text) {
+    input.value = input.value.trim() ? `${input.value.trimEnd()}\n\n${text}` : text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  if (files.length) box.querySelector('.followup-files')?._attach?.(files);
+  input.focus();
+}
+/** Resolves with the first element matching `selector` once the page shows it (or null after `ms`). */
+function whenOnPage(selector, ms = 8000) {
+  const deadline = Date.now() + ms;
+  return new Promise((resolve) => {
+    const look = () => {
+      const el = document.querySelector(selector);
+      if (el || Date.now() > deadline) return resolve(el || null);
+      setTimeout(look, 100);
+    };
+    look();
+  });
 }
 
 // Once per app start, signed in: links and the tray open their pages, a tapped
 // notification opens its page, and a phone with push on registers again, so a
 // rotated FCM token replaces the old one.
 let nativeAppWired = false;
+// Links that arrive while the console boots (the one an app was started by) wait for its first page.
+let markConsoleReady;
+const consoleReady = new Promise((resolve) => { markConsoleReady = resolve; });
 async function wireNativeApp() {
   if (nativeAppWired || !nativeApp()) return;
   nativeAppWired = true;
-  await desktopShell()?.addListener('open', (link) => openAppLink(link || {}));
+  await desktopShell()?.addListener('open', (link) => consoleReady.then(() => openAppLink(link || {})));
   await desktopShell()?.addListener('updateStatus', (status) => paintAppUpdate(status));
   // Capacitor's App plugin, where a phone shell has it, hands over the links it was opened with.
-  await nativePlugin('App')?.addListener('appUrlOpen', ({ url }) => openAppLink({ url }));
+  await nativePlugin('App')?.addListener('appUrlOpen', ({ url }) => consoleReady.then(() => openAppLink({ url })));
+  // A share the shell could not announce (iOS's Share Extension may be unable to
+  // open the app) is taken when the app starts or comes back to the front.
+  if (nativePlugin('TavyaPhone')) {
+    consoleReady.then(() => receiveShare());
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') consoleReady.then(() => receiveShare()); });
+  }
   syncAppBadge(forMeTotal());
   const push = nativePlugin('PushNotifications');
   if (!push) return;
@@ -28555,7 +28700,7 @@ function profileView() {
         ${profileWalkthroughRow(u?.id)}
       </div>
     </div>
-    ${desktopShell() ? thisAppCard() : ''}
+    ${desktopShell() ? thisAppCard() : nativePlugin('TavyaPhone') ? phoneAppCard() : ''}
     ${notificationsCard()}
     ${S.meta?.hosted ? '<div class="card" id="profile-plans-card"><div class="section-h">Plans &amp; billing</div><div id="profile-plans" aria-live="polite"><span class="task-sub">Loading…</span></div></div>' : ''}
     ${u ? appGrantsCard() : ''}
@@ -28795,6 +28940,36 @@ function thisAppCard() {
     </div>
   </div>`;
 }
+// A phone app's own settings: on Android, whether tavya is the phone's digital
+// assistant (the system's setting; the app can only open it). Hidden where the
+// phone has no such role (iOS: Siri asks tavya through App Shortcuts).
+function phoneAppCard() {
+  return `<div class="card" id="this-app" hidden>
+    <div class="section-h">This app</div>
+    <div class="setting-rows">
+      <div class="setting-row" id="app-assistant">
+        <span class="setting-label">Digital assistant ${policyTip(`Long-press the power or home button to ask ${siteName()}. Choosing ${siteName()} replaces Google’s assistant and “Hey Google” on this phone.`)}</span>
+        <span class="setting-value setting-muted"></span>
+        <span class="setting-actions"><button class="btn sm" type="button" id="app-assistant-open">Change</button></span>
+      </div>
+    </div>
+  </div>`;
+}
+async function wirePhoneApp() {
+  const phone = nativePlugin('TavyaPhone'), card = $('#this-app');
+  if (!phone || !card || desktopShell()) return;
+  const paint = async () => {
+    const state = await phone.assistant().catch(() => null);
+    if (!card.isConnected) return;
+    card.hidden = !state?.available;
+    card.querySelector('#app-assistant .setting-value').textContent = state?.held ? siteName() : 'Another app';
+  };
+  card.querySelector('#app-assistant-open').addEventListener('click', () => phone.openAssistantSettings().catch((error) => toast(plainError(error), true)));
+  // Back from the system's settings: show what was chosen there.
+  const onVisible = () => { if (!card.isConnected) return document.removeEventListener('visibilitychange', onVisible); if (document.visibilityState === 'visible') paint(); };
+  document.addEventListener('visibilitychange', onVisible);
+  await paint();
+}
 // Electron's names for keys (its accelerators), from a keydown.
 function acceleratorOf(event) {
   const named = { ' ': 'Space', ArrowUp: 'Up', ArrowDown: 'Down', ArrowLeft: 'Left', ArrowRight: 'Right', Enter: 'Return', Escape: 'Esc' };
@@ -28892,6 +29067,7 @@ function wireProfileView() {
   if (S.profileUserId && S.profileUserId !== S.user?.id) return;
   wireNotificationsCard();
   wireThisApp().catch(() => {});
+  wirePhoneApp().catch(() => {});
   void hydrateProfilePlans();
   void hydrateAppGrants();
   void hydrateChatLinks();

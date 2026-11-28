@@ -50,6 +50,13 @@ export function fcmRequestBody(token: string, message: PushMessage, ttlSeconds: 
   } };
 }
 
+/** A data-only message: Android runs the app's messaging service for it even in
+ *  the background (a notification message is shown by the system alone), so the
+ *  app refreshes its home-screen widget (wiki features/phone-apps § Widget). */
+export function fcmRefreshBody(token: string): object {
+  return { message: { token, data: { type: 'refresh' }, android: { priority: 'NORMAL', ttl: '3600s', collapse_key: 'tavya-refresh' } } };
+}
+
 export class NativePush {
   private tokens: GoogleAccessTokens;
   private cached?: { account: GoogleServiceAccount | undefined; at: number };
@@ -95,10 +102,19 @@ export class NativePush {
 
   /** Send one message to one device. Throws only when native push is not configured. */
   async send(token: string, message: PushMessage, ttlSeconds: number): Promise<FcmOutcome> {
+    return this.post(fcmRequestBody(token, message, ttlSeconds));
+  }
+
+  /** Tell an Android phone to refresh what it shows outside the app (best effort). */
+  async refresh(token: string): Promise<FcmOutcome> {
+    return this.post(fcmRefreshBody(token));
+  }
+
+  private async post(message: object): Promise<FcmOutcome> {
     const account = await this.account();
     if (!account) throw new Error('native push is not configured');
     const fetcher = this.options.fetcher ?? fetch;
-    const body = JSON.stringify(fcmRequestBody(token, message, ttlSeconds));
+    const body = JSON.stringify(message);
     for (let attempt = 0; ; attempt++) {
       let response: Response;
       try {
