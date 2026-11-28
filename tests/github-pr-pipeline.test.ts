@@ -2243,9 +2243,11 @@ describe('software-dev with remote policy "pr" (real Temporal + git, stub GitHub
       // B's CI stays pending, so the run waits in Landing with A already merged.
       githubReadinessBySlug.set(slugB, { statusCheckRollup: { state: 'PENDING', contexts: { nodes: [] } } });
       await handle.signal('confirm');
+      // Reconciliation fails the run from its stored view, which an activity
+      // saves after the live one changes: wait for that, not the query.
       await expect.poll(async () => {
-        const current = await view(handle);
-        return `${current.stage}/${current.pointOfNoReturnPassed}`;
+        const current = (await h.store.getTask(task.id))?.lastView;
+        return `${current?.stage}/${current?.pointOfNoReturnPassed}`;
       }, { timeout: 30_000 }).toBe('merge/true');
       await handle.terminate('Workflow history size exceeds limit.');
       (await reconcileTasks(h.store, h.client));
