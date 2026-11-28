@@ -61,7 +61,7 @@ const esc = (value: unknown) => String(value ?? '')
 
 /** Whether `pathname` may be a public page (or a spelling of one); every other path is the console.
  * The first segments are reserved for organizations in src/store/db.ts (RESERVED_ORGANIZATION_SLUGS). */
-export const publicPath = (pathname: string) => pathname === '/' || /^\/(docs|pricing|legal|compare|about|changelog)(\/|$)/.test(pathname);
+export const publicPath = (pathname: string) => pathname === '/' || /^\/(?:(docs|pricing|legal|compare|about|changelog)(\/|$)|download\/?$)/.test(pathname);
 
 /** The policy a /legal/<slug> URL names, if it is one. */
 export function policySlugOf(pathname: string): string | undefined {

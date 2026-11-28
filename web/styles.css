@@ -2750,6 +2750,13 @@ html[data-theme="dark"] .lp-light { display: none; }
 .docs-content .legal-document h1,.docs-content .legal-index h1,.docs-content .pricing-page h1 { margin-top:12px; }
 .docs-page { max-width:720px; color:var(--l-text); font-size:16px; line-height:1.7; }
 .docs-page h1 { color:var(--l-ink); }
+.download-hero { display:flex; flex-wrap:wrap; align-items:center; gap:10px 16px; margin:20px 0 8px; }
+.docs-page .download-hero a.landing-start { color:var(--l-primary-ink); text-decoration:none; }
+.docs-page .download-hero span.landing-sign-in { color:var(--l-ink-3); cursor:default; }
+.download-version { color:var(--l-ink-3); font-size:14px; }
+.store-badges { display:flex; flex-wrap:wrap; align-items:center; gap:4px 12px; }
+.store-badge { display:inline-flex; }
+.store-badge img { display:block; width:auto; }
 .docs-page h2 { margin:40px 0 10px; color:var(--l-ink); font-size:20px; line-height:1.3; letter-spacing:-.02em; scroll-margin-top:16px; }
 .docs-page h3 { margin:28px 0 8px; color:var(--l-ink); font-size:16px; scroll-margin-top:16px; }
 .docs-page h1 + .md-p { color:var(--l-ink-2); font-size:18px; }

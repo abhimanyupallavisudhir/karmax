@@ -17,6 +17,7 @@ import { GatewayMetrics, type MemorySource } from './metrics.js';
 import { MIME, ARTIFACT_MIME } from '../store/artifact-mime.js';
 import { assetExists, MATHJAX_SCRIPT_SOURCE, serveStaticAsset, staticAssetRevision, unpublishedAsset } from './static-assets.js';
 import { announceChangedPages, indexNowKeyFile } from './indexnow.js';
+import { DesktopReleases, serveDesktopDownload } from './desktop-downloads.js';
 import { LANDING_TAGLINE, llmsFullText, llmsPageList, markdownSource, policySlugOf, publicBody, publicEntries, publicHead, publicPath, resolvePublicRoute, robotsTxt, sitemapXml, type PublicPageContext, type PublicRoute } from './public-pages.js';
 import { SwrCache } from '../util/swr-cache.js';
 import { MAX_REVIEW_ARTIFACT_BYTES, savedReviewArtifact } from '../store/review-artifacts.js';
@@ -236,6 +237,8 @@ export interface GatewayDeps {
   remoteAccess?: RemoteAccessController;
   /** Fetches OAuth client ID metadata documents (default: the outbound SSRF guard). */
   oauthMetadataFetch?: typeof fetch;
+  /** The desktop apps' releases behind /download/desktop/ (default: GitHub, KARMAX_DESKTOP_RELEASES_REPO). */
+  desktopReleases?: DesktopReleases;
   /** Model benchmarks for the model picker (default: the bundled snapshot,
    *  refreshed daily when ARTIFICIAL_ANALYSIS_API_KEY is set). */
   artificialAnalysis?: ArtificialAnalysis;
@@ -874,6 +877,7 @@ export class Gateway {
   /** App grants and the OAuth server they come from (`oauth-routes.ts`). */
   private appGrants!: AppGrants;
   private oauthRoutes!: OAuthRoutes;
+  private desktopReleases!: DesktopReleases;
   /** Marks the remote MCP server's loopback `/api` calls as this gateway's own. */
   private loopbackSecret = crypto.randomBytes(24).toString('hex');
   private loopbackUrl?: string;
@@ -905,6 +909,7 @@ export class Gateway {
     const identity = deps.identity;
     this.appGrants = new AppGrants(deps.store, identity ? { sessions: {
       state: (id) => identity.sessionState(id), end: (id) => identity.endSession(id) } } : {});
+    this.desktopReleases = deps.desktopReleases ?? new DesktopReleases({ repo: process.env.KARMAX_DESKTOP_RELEASES_REPO });
     this.oauthRoutes = new OAuthRoutes({ store: deps.store, grants: this.appGrants, authorization: deps.authorization,
       oauth: new OAuthServer(deps.store, this.appGrants, { fetchMetadata: deps.oauthMetadataFetch }),
       hostLocal: () => this.hostLocal,
@@ -1973,6 +1978,8 @@ export class Gateway {
     if (sharedFiles && (req.method === 'GET' || req.method === 'HEAD')) return this.serveSharedFiles(req, res, url, sharedFiles[1]!, !!sharedFiles[2]);
     if (p.startsWith('/scim/v2/')) return this.scim(req, res, url);
     if (p.startsWith('/brand/')) return this.brand(p, res, req);
+    // The desktop apps' downloads and update feed (wiki features/desktop-apps).
+    if (await serveDesktopDownload(req, res, p, this.desktopReleases)) return;
     if (p === '/app.webmanifest' && req.method === 'GET') return (await this.webManifest(res));
     // A CLI older than this server speaks to is told to update, not left to misread a newer API.
     const cliVersion = cliVersionOf(req.headers['user-agent']);

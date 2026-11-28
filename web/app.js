@@ -31774,7 +31774,7 @@ function readPolicyAcceptance(context) {
 }
 
 function legalFooter() {
-  return `<footer class="legal-footer"><a href="/">${siteNameMarkup()}</a><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/legal">Policies</a>
+  return `<footer class="legal-footer"><a href="/">${siteNameMarkup()}</a><a href="/docs">Docs</a><a href="/pricing">Pricing</a><a href="/download">Download</a><a href="/legal">Policies</a>
     <a href="/legal/security">Security</a><a href="/legal/dpa">DPA requests</a></footer>`;
 }
 
@@ -31784,7 +31784,8 @@ function legalFooter() {
 // under one sidebar. `{{origin}}` in a page is this server, so the commands it
 // shows work on a self-hosted installation too.
 const sitePages = () => globalThis.KarmaxSite?.pages || [];
-const PUBLIC_PATH = /^\/(docs|pricing|legal|compare|about|changelog)(\/|$)/;
+// /download is a page; /download/desktop/<file> are files the gateway serves.
+const PUBLIC_PATH = /^\/(?:(docs|pricing|legal|compare|about|changelog)(\/|$)|download\/?$)/;
 
 function docsAnchor(text) { return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''); }
 
@@ -31866,6 +31867,7 @@ async function renderSitePage(path = '/docs') {
   article.className = 'docs-page';
   article.append(template.content);
   renderPublicShell(page.path, `<main>${article.outerHTML}</main>`);
+  if (page.path === '/download') enhanceDownloadPage();
   for (const button of document.querySelectorAll('.docs-copy')) button.addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(button.previousElementSibling.textContent);
@@ -31873,6 +31875,44 @@ async function renderSitePage(path = '/docs') {
       setTimeout(() => button.classList.remove('copied'), 1200);
     } catch { /* the text stays selectable */ }
   });
+}
+
+// /download (web/download.md; wiki features/desktop-apps): the button for this
+// computer first, with the version it gets (/download/desktop/latest.json), and
+// the phone stores once the installation has their links (/api/launch appStores).
+function downloadTarget(agent = navigator.userAgent, platform = navigator.platform || '') {
+  if (/iPhone|iPad|Android/i.test(agent)) return null;
+  if (/Macintosh|Mac OS X/.test(agent)) return { file: 'tavya-mac.dmg', label: 'Download for Mac' };
+  if (!/Linux|X11/.test(agent)) return null;
+  const arch = /aarch64|arm64|armv8/i.test(`${platform} ${agent}`) ? 'arm64' : 'x64';
+  // Debian and Ubuntu say so in some browsers' user agent; otherwise the AppImage runs anywhere.
+  return /Ubuntu|Debian/i.test(agent) ? { file: `tavya-linux-${arch}.deb`, label: 'Download for Linux', detail: '.deb' }
+    : { file: `tavya-linux-${arch}.AppImage`, label: 'Download for Linux', detail: 'AppImage' };
+}
+async function enhanceDownloadPage() {
+  const article = $('.docs-page');
+  if (!article) return;
+  const stores = S.launch?.appStores || {};
+  const badges = [stores.ios && `<a href="${esc(stores.ios)}" class="store-badge" target="_blank" rel="noopener noreferrer"><img src="/media/badges/app-store.svg" alt="Download on the App Store" height="40"></a>`,
+    stores.android && `<a href="${esc(stores.android)}" class="store-badge" target="_blank" rel="noopener noreferrer"><img src="/media/badges/google-play.png" alt="Get it on Google Play" height="58"></a>`].filter(Boolean);
+  if (badges.length) {
+    const using = article.querySelector('#using-it');
+    const section = `<h2 id="phones">Phones</h2><div class="store-badges">${badges.join('')}</div>`;
+    if (using) using.insertAdjacentHTML('beforebegin', section);
+    else article.insertAdjacentHTML('beforeend', section);
+  }
+  const target = downloadTarget();
+  if (!target) return;
+  const lede = article.querySelector('h1 + .md-p') || article.querySelector('h1');
+  lede.insertAdjacentHTML('afterend', `<div class="download-hero"><a class="landing-start lp-large" id="download-this" href="/download/desktop/${target.file}">${esc(target.label)}</a>
+    <span class="download-version" id="download-version">${target.detail ? esc(target.detail) : ''}</span></div>`);
+  const latest = await fetch('/download/desktop/latest.json').then((response) => response.ok ? response.json() : null).catch(() => null);
+  const version = $('#download-version');
+  if (!version) return;
+  if (latest && !latest.version) {
+    $('#download-this')?.replaceWith(Object.assign(document.createElement('span'), { className: 'landing-sign-in lp-large', textContent: 'Coming soon' }));
+    version.textContent = '';
+  } else if (latest?.version) version.textContent = [`Version ${latest.version}`, target.detail].filter(Boolean).join(' · ');
 }
 
 async function renderLegalPage(slug) {
@@ -32010,6 +32050,7 @@ function renderLanding() {
       <nav class="landing-nav-actions" aria-label="Site">
         <a href="/docs" class="landing-text-link">Docs</a>
         <a href="/pricing" class="landing-text-link">Pricing</a>
+        <a href="/download" class="landing-text-link">Download</a>
         <a href="${source}" class="landing-text-link">GitHub</a>
         <a class="landing-sign-in" id="landing-sign-in" href="/login">Sign in</a>
         <a class="landing-start" id="landing-start" href="/signup">Get started</a>

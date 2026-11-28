@@ -21,7 +21,7 @@ const site = globalThis.KarmaxSite;
     // The server omits draftNotice once the operator opens paid checkout.
     const open = async (viewport = { width: 1280, height: 800 }, { approved = false } = {}) => {
       const draft = approved ? {} : { draftNotice: 'Draft.' };
-      const launchInfo = { policyVersion: '1', ...draft, policies, pricingCatalog: [
+      const launchInfo = { policyVersion: '1', ...draft, policies, appStores: { ios: 'https://apps.apple.com/app/tavya/id6700000000', android: null }, pricingCatalog: [
         { id: 'free', name: 'Free', monthlyBasePriceCents: 0, currency: 'usd', maxMembers: 1, maxActiveAgentRuns: 1, storageBytes: 1e9 }] };
       const context = await browser.newContext({ serviceWorkers: 'block', viewport });
       const { requests } = await fakeConsole(context, { project: { id: 'p', organizationId: 'o', name: 'Website', config: {} }, async api(p) {
@@ -51,8 +51,8 @@ const site = globalThis.KarmaxSite;
       ['Compare', '/compare'],
       ['Pricing', '/pricing'],
       ['Policies', '/legal'], ['Terms of Service', '/legal/terms'], ['Privacy Policy', '/legal/privacy'],
-      ['About', '/about'], ['Changelog', '/changelog'],
-    ], 'one sidebar: the docs and guides, the comparison, pricing, every policy, then About and the changelog');
+      ['Download', '/download'], ['About', '/about'], ['Changelog', '/changelog'],
+    ], 'one sidebar: the docs and guides, the comparison, pricing, every policy, then Download, About and the changelog');
     assert.equal(await current(), 'Getting started');
     assert.match(await page.title(), /Getting started · Fixture/);
     if (shots) await page.screenshot({ path: path.join(shots, 'docs-getting-started.png'), fullPage: true });
@@ -119,6 +119,8 @@ const site = globalThis.KarmaxSite;
       const links = await page.locator('.docs-page a[href^="/"]').evaluateAll((as) => as.map((a) => [a.getAttribute('href'), 'public' in a.dataset]));
       for (const [href, inPlace] of links) {
         const [route, hash] = href.split('#');
+        // The desktop apps' files (/download/desktop/<file>) are downloads the gateway serves, never pages.
+        if (route.startsWith('/download/desktop/')) { assert.ok(!inPlace, `${entry.path}: download ${href} is not swapped in place`); continue; }
         const known = byPath.has(route) || ['/pricing', '/legal', '/signup', '/login'].includes(route) || /^\/legal\/[a-z-]+$/.test(route);
         assert.ok(known, `${entry.path}: link ${href} goes to a page`);
         if (!['/signup', '/login'].includes(route)) assert.ok(inPlace, `${entry.path}: link ${href} opens in place`);
@@ -146,6 +148,25 @@ const site = globalThis.KarmaxSite;
     await page.goto('http://console.test/compare/nope');
     await page.locator('.docs-page h1', { hasText: 'tavya compared' }).waitFor();
     assert.equal(await page.evaluate(() => location.pathname), '/compare');
+
+    // Download: the button for this computer first, with the version it gets; the stores that are set.
+    await context.route('http://console.test/download/desktop/latest.json', (route) => route.fulfill({ json: { version: '1.2.0', files: {} } }));
+    await page.goto('http://console.test/download');
+    await page.locator('#download-this').waitFor();
+    assert.equal(await page.locator('#download-this').getAttribute('href'), '/download/desktop/tavya-linux-x64.AppImage');
+    await page.locator('#download-version', { hasText: 'Version 1.2.0 · AppImage' }).waitFor();
+    assert.deepEqual(await page.locator('.store-badge img').evaluateAll((images) => images.map((image) => image.alt)), ['Download on the App Store'],
+      'only the stores the installation has links for');
+    if (shots) await page.screenshot({ path: path.join(shots, 'download.png'), fullPage: true });
+    const mac = await browser.newContext({ serviceWorkers: 'block', userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36' });
+    await fakeConsole(mac, { project: { id: 'p', organizationId: 'o', name: 'Website', config: {} }, async api(p) { if (p === '/api/launch') return { policyVersion: '1', policies, pricingCatalog: [] }; } });
+    await mac.route('http://console.test/download/desktop/latest.json', (route) => route.fulfill({ json: { version: null, files: {} } }));
+    const macPage = await mac.newPage();
+    await macPage.goto('http://console.test/download');
+    await macPage.locator('.download-hero', { hasText: 'Coming soon' }).waitFor();
+    assert.equal(await macPage.locator('#download-this').count(), 0, 'before the first release, no dead button');
+    assert.equal(await macPage.locator('.store-badge').count(), 0, 'no stores without links');
+    await mac.close();
 
     // An unknown docs page falls back to the first one.
     await page.goto('http://console.test/docs/nope');

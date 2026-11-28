@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'" />
+    <title>tavya</title>
+    <!-- Shown by src/main.cjs when the console can't be loaded; ?url= is the page it tried. -->
+    <style>
+      :root { color-scheme: dark; }
+      html, body { margin: 0; height: 100%; }
+      body {
+        display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 16px;
+        padding: 24px; box-sizing: border-box; text-align: center;
+        background: #181220; color: #ede8f5;
+        font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif;
+        -webkit-user-select: none; user-select: none;
+      }
+      img { width: 88px; height: 88px; }
+      h1 { margin: 8px 0 0; font-size: 19px; font-weight: 600; overflow-wrap: anywhere; }
+      p { margin: 0; color: #b9b0c8; }
+      button {
+        margin-top: 8px; min-width: 140px; padding: 9px 22px; border: 0; border-radius: 8px;
+        background: #e3b344; color: #181220; font: inherit; font-weight: 600; cursor: pointer;
+      }
+      button:hover { background: #f2cf78; }
+    </style>
+  </head>
+  <body>
+    <img src="assets/icon.png" alt="" />
+    <h1 id="title">Can't reach tavya</h1>
+    <p>Check your connection. tavya keeps trying.</p>
+    <button id="retry" type="button">Retry</button>
+    <script>
+      (function () {
+        var url = new URLSearchParams(location.search).get('url') || 'https://tavya.io';
+        try { document.getElementById('title').textContent = "Can't reach " + new URL(url).host; } catch (e) {}
+        function retry() { location.replace(url); }
+        document.getElementById('retry').addEventListener('click', retry);
+        window.addEventListener('online', retry);
+        setTimeout(retry, 15000);
+      })();
+    </script>
+  </body>
+</html>
