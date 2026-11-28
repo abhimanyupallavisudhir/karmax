@@ -33,7 +33,7 @@ describe('ignored approval rows', () => {
     const render = context[`${kind}RequestRows`];
     expect(render([request])).toContain(IGNORE);
     // A pending request asks its question with Allow / Deny; no separate "approval needed" badge.
-    expect(render([request])).toMatch(/approval-request-title">[^<]*\?/);
+    expect(render([request])).toMatch(/approval-request-title">(<span[^>]*>)?[^<]*\?/);
     expect(render([request])).not.toContain('approval-needed');
     const ignored = render([{ ...request, dismissed: { by: 'approver', at: 1 } }]);
     expect(ignored).toContain('approval-request-dismissed');

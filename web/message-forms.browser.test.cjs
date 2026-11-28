@@ -121,7 +121,7 @@ const outside = `${fence({ fields: [{ name: 'who' }], save: { method: 'POST', pa
       // another ask replacing it leaves it there, and live.
       const asked = { id: 'ask-1', role: 'agent', author: 'do', to: ['@creator'], text: googleClientAsk, ts: T0 + 3000 };
       const replaced = await open([...before(), asked], 'light', { view: { participants,
-        waitingFor: { kind: 'human', audience: ['@creator'], detail: 'Permission requested: settings:read, settings:write — To save the Google OAuth client.' } } });
+        waitingFor: { kind: 'human', audience: ['@creator'], detail: "Let #5's agent view and edit global settings? — To save the Google OAuth client." } } });
       assert.equal(await replaced.page.locator('#ck-thread .msg.agent:not(.input-request) form.ask-form.live').count(), 1, 'the question stays, still answerable');
       assert.equal(await replaced.page.locator('#ck-thread .msg.input-request').count(), 1, 'beside the ask that replaced it');
       if (shots) { await replaced.page.locator('#ck-thread .msg.agent:not(.input-request) form.ask-form').scrollIntoViewIfNeeded(); await replaced.page.screenshot({ path: `${shots}/form-escalation-replaced.png` }); }

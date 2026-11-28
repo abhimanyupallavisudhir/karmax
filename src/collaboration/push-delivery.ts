@@ -34,7 +34,8 @@ const clip = (text: string, max: number) => text.length > max ? `${text.slice(0,
 const day = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
 /** The inbox row's own words (web/app.js inboxRowLabel), for a device. */
-function label(item: InboxItem, status?: string): string {
+function label(item: InboxItem, status?: string, ask?: string): string {
+  if (ask) return ask;
   const subject = item.subject as Record<string, any> | undefined;
   if (subject?.kind === 'service-limit') return subject.level === 'failed' ? `Can’t read ${subject.serviceName} usage`
     : `${subject.serviceName} at ${Math.floor((subject.used / subject.limit) * 100)}% of its limit${subject.level === 95 ? ' — upgrade now' : ''}`;
@@ -83,7 +84,7 @@ export function pushMessage(envelope: DeliveryEnvelope, context: {
   const number = task?.num != null ? `#${task.num} · ` : '';
   return {
     title: clip(title(inbox, task, context.siteName), 120),
-    body: clip(`${number}${label(inbox, task?.status)}`, 240),
+    body: clip(`${number}${label(inbox, task?.status, envelope.ask)}`, 240),
     url: route(inbox, task, context.organization, context.project),
     // The console's own popup for this ask has the same tag, so one replaces the other.
     tag: inbox.id,

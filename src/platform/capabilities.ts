@@ -259,6 +259,26 @@ function definition([id, label, description]: readonly [KnownCapability, string,
   return { id, label, description };
 }
 
+const CAPABILITY_LABELS = new Map<string, string>(CAPABILITY_GROUPS.flatMap((group) =>
+  group.capabilities.map((capability) => [capability.id, capability.label] as const)));
+
+/**
+ * What a capability lets its holder do, in words a person reads without
+ * decoding ids: its catalogue label in a sentence ("edit global settings",
+ * "operate GitHub Actions"); a concrete one of a family by its kind ("merge
+ * into main", "use a payment card"). An unknown one is its id.
+ */
+export function capabilityPhrase(raw: Capability): string {
+  const capability = normalizeCapability(raw);
+  const label = CAPABILITY_LABELS.get(capability);
+  if (label) return label[0]!.toLowerCase() + label.slice(1);
+  if (capability.startsWith('merge-into:') && capability.length > 'merge-into:'.length) return `merge into ${capability.slice('merge-into:'.length)}`;
+  if (capability.startsWith('use-credential:item:')) return 'use a credential from the vault';
+  if (capability.startsWith('use-credential:') && capability.length > 'use-credential:'.length) return `use the ${capability.slice('use-credential:'.length)} credential`;
+  if (capability.startsWith('use-card:') && capability !== 'use-card:*') return 'use a payment card';
+  return capability;
+}
+
 /** Does `pattern` (possibly with trailing `*` segment or bare `*`) cover `cap`? */
 export function capMatches(pattern: Capability, cap: Capability): boolean {
   // Before workflow installation was split from editing, the single legacy

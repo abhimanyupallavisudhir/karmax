@@ -107,7 +107,7 @@ describe('who decided a permission request', () => {
     try {
       const id = await f.ask();
       expect(await f.stored(id)).toMatchObject({ audience: [`task:${f.ceo.id}`], taskRecipients: [f.ceo.id, f.lead.id] });
-      expect(f.to(f.ceo.id).map((message) => message.text)).toEqual([expect.stringContaining('asks you for github:actions:write, which you hold')]);
+      expect(f.to(f.ceo.id).map((message) => message.text)).toEqual([expect.stringContaining('asks you for permission to operate GitHub Actions (github:actions:write), which you hold')]);
     } finally { await f.store.close(); }
   });
 
@@ -125,7 +125,7 @@ describe('who decided a permission request', () => {
       // The event, and what the asking agent is told.
       const events = await f.store.eventsOfType(f.child.id, 'permission.approval-resolved');
       expect(events.map((event) => event.payload.resolvedBy)).toEqual([`task-agent:${f.lead.id}:do`]);
-      expect(f.to(f.child.id).at(-1)!.text).toContain(`Denied by Task #${f.lead.num}'s agent for this task's do agent`);
+      expect(f.to(f.child.id).at(-1)!.text).toContain(`Denied by Task #${f.lead.num}'s agent: this task's do agent may not `);
       expect(JSON.stringify(listed)).not.toContain('user:owner');
     } finally { await f.store.close(); }
   });

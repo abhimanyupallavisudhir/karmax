@@ -509,6 +509,8 @@
   "tests/payment-policy-currency.test.ts": 0.5,
   "tests/payments.test.ts": 1.6,
   "tests/pending-timers.test.ts": 0.1,
+  "tests/permission-ask.browser.test.ts": 1.7,
+  "tests/permission-ask.test.ts": 0,
   "tests/permission-requests.test.ts": 0.8,
   "tests/pg-backup.test.ts": 0,
   "tests/phase-e.test.ts": 11,
