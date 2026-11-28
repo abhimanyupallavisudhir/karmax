@@ -14,8 +14,8 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
   const get = (p: string) => fetch(`${base}${p}`, { headers: auth() }).then(J);
   const post = (p: string, body: any) => fetch(`${base}${p}`, { method: 'POST', headers: auth(), body: JSON.stringify(body) }).then(J);
   const put = (p: string, body: any) => fetch(`${base}${p}`, { method: 'PUT', headers: auth(), body: JSON.stringify(body) }).then(J);
-  const poll = async (id: string, stage: string, status?: string) => {
-    for (let i = 0; i < 60; i++) {
+  const poll = async (id: string, stage: string, status?: string, waitMs = 15_000) => {
+    for (let i = 0; i < waitMs / 250; i++) {
       const v = await get(`/api/tasks/${id}`);
       if (v?.stage === stage && (!status || v.status === status)) return v;
       await new Promise((r) => setTimeout(r, 250));
@@ -343,8 +343,10 @@ describe('task forms, drafts, settings, agent resume (end-to-end)', () => {
     // Both forked; the source is still untouched after two concurrent resumes.
     expect(await get(`/api/tasks/${a.id}/sessions`)).toEqual(aBefore);
     await Promise.all([post(`/api/tasks/${b.id}/signal`, { signal: 'confirm' }), post(`/api/tasks/${c.id}/signal`, { signal: 'confirm' })]);
-    await Promise.all([poll(b.id, 'done'), poll(c.id, 'done')]);
-  });
+    // Two Confirms land at once and queue behind each other: on a loaded CI
+    // shard the second took over 15 s to reach Done (CI #3195, shard 3/9).
+    await Promise.all([poll(b.id, 'done', undefined, 45_000), poll(c.id, 'done', undefined, 45_000)]);
+  }, 90_000);
 
   it('lets the dedicated fork-agent endpoint choose a new agent and retains its source', async () => {
     const { a } = await runSource('Tool fork source', { provider: 'mock', model: 'source-model', effort: 'high' });

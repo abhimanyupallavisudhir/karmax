@@ -5,7 +5,8 @@
 // Keep a file and a folder, see the bytes on disk read-only by their SHA-256,
 // show one in the app from tavya-offline://, Open in… with the default app,
 // open the app with tavya unreachable (the service worker's offline shell),
-// and let go. Runs where desktop/ is installed and there is a display
+// and let go; an edit saved offline outliving a restart with the WebView's
+// storage wiped (the plugin's copy of the outbox), then merged. Runs where desktop/ is installed and there is a display
 // (desktop.yml, under xvfb-run); skips elsewhere.
 // Screens: KARMAX_SHOTS=<dir> xvfb-run npx vitest run tests/offline-files.electron.test.ts
 import crypto from 'node:crypto';
@@ -15,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { _electron, type ElectronApplication, type Page } from 'playwright';
 import { afterEach, describe, expect, it } from 'vitest';
-import { projectFilesFixture } from './helpers/project-files-fixture.js';
+import { capsOf, projectFilesFixture, sh } from './helpers/project-files-fixture.js';
 
 const DESKTOP = path.resolve('desktop');
 const electronPath = (() => {
@@ -112,5 +113,58 @@ describe.skipIf(!runnable)('offline files in the desktop app', () => {
     await page.locator('.files-menu button', { hasText: 'Remove from this device' }).click();
     await expect.poll(() => stored()).toEqual([sha256('## Guide\n')]);
     expect(errors).toEqual([]);
+  }, 120_000);
+
+  it('keeps an offline edit through a restart that wiped the WebView’s storage, then merges it', async () => {
+    const f = await projectFilesFixture(cleanups, { files: { 'notes.md': 'one\ntwo\nthree\nfour\nfive\n' } });
+    const userData = fs.mkdtempSync(path.join(os.tmpdir(), 'tavya-desktop-edits-'));
+    cleanups.push(() => fs.rmSync(userData, { recursive: true, force: true }));
+    const launch = async () => {
+      const app = await _electron.launch({ executablePath: electronPath!, args: [DESKTOP],
+        env: { ...process.env, TAVYA_URL: f.server.url, TAVYA_DESKTOP_USER_DATA: userData, ELECTRON_ENABLE_LOGGING: '0' } as Record<string, string> });
+      cleanups.push(() => app.close().catch(() => {}));
+      const page = await app.firstWindow();
+      page.setDefaultTimeout(15_000);
+      const errors: string[] = [];
+      page.on('pageerror', (error) => errors.push(error.message));
+      return { app, page, errors };
+    };
+    const edits = path.join(userData, 'offline-edits');
+    const queued = () => fs.existsSync(edits) ? fs.readdirSync(edits).filter((name) => name.endsWith('.json')) : [];
+    const bare = path.join(f.remotes, f.owner, 'site.git');
+
+    // Kept offline, then saved with tavya out of reach: in the plugin's store on disk.
+    const first = await launch();
+    await first.page.goto(`${f.server.url}/personal/site-builder/files/site`);
+    const row = first.page.locator('#files-body .files-row', { hasText: 'notes.md' }).first();
+    await row.hover();
+    await row.locator('.files-more').click();
+    await first.page.locator('.files-menu [role="menuitemcheckbox"]', { hasText: 'Available offline' }).click();
+    await row.locator('.offline-mark[data-state="current"]').waitFor();
+    await first.page.goto(`${f.server.url}/personal/site-builder/files/site/notes.md`);
+    await first.page.route('**/files/changes**', (route) => route.abort('internetdisconnected'));
+    await first.page.locator('#files-edit').click();
+    await first.page.locator('#files-edit-area').fill('one\ntwo\nthree\nfour\nFIVE (desktop)\n');
+    await first.page.keyboard.press('Control+s');
+    await first.page.locator('#offline-edit-bar').waitFor();
+    expect(queued()).toHaveLength(1);
+    expect(JSON.parse(fs.readFileSync(path.join(edits, queued()[0]!), 'utf8'))).toMatchObject({ path: 'site/notes.md', content: 'one\ntwo\nthree\nfour\nFIVE (desktop)\n', device: 'Linux' });
+    expect(first.errors).toEqual([]);
+    await first.app.close();
+
+    // The WebView's storage is lost (IndexedDB gone); someone changes another line meanwhile.
+    fs.rmSync(path.join(userData, 'IndexedDB'), { recursive: true, force: true });
+    const developer = await f.tokenFor(capsOf('developer') as string[]);
+    const now = await (await f.get('site/notes.md', developer)).json();
+    expect((await fetch(`${f.server.url}/api/projects/${f.project.id}/files/changes`, { method: 'POST',
+      headers: { authorization: `Bearer ${developer}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ changes: [{ op: 'write', path: 'site/notes.md', text: 'ONE (theirs)\ntwo\nthree\nfour\nfive\n', expect: now.version }] }) })).status).toBe(200);
+
+    // Started again: the plugin's copy brings the edit back, and it is merged at once.
+    const second = await launch();
+    await second.page.locator('.toast', { hasText: 'Merged with newer changes' }).waitFor({ timeout: 30_000 });
+    expect(sh(bare, 'show', 'main:notes.md')).toBe('ONE (theirs)\ntwo\nthree\nfour\nFIVE (desktop)\n');
+    expect(queued()).toEqual([]);
+    expect(second.errors).toEqual([]);
   }, 120_000);
 });

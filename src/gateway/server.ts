@@ -96,7 +96,7 @@ type Repository = import('../domain/types.js').Repository;
 import { projectArtifactGallery, type GalleryArtifact } from '../platform/artifact-gallery.js';
 import { checkOfflinePins, OFFLINE_CHECK_MAX } from '../world/offline-files.js';
 import { FileAccessError, FileNotFoundError, ManifestTooLargeError, ProjectFiles, projectRepositoryCredential, splitPath, type FileNode, type FileView, type OpenedFile } from '../world/project-files.js';
-import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange, type FileKeeping } from '../world/project-file-changes.js';
+import { CHANGE_LIMITS, FileConflictError, ProjectFileChanges, type FileChange, type FileKeeping, type OfflineEditOrigin } from '../world/project-file-changes.js';
 import { createFileShare, currentFileShare, projectFileShares, publicFileShare, publicFilesHtml, revokeFileShare, type FileShare } from './file-sharing.js';
 import { cliVersionOf, olderVersion } from '../domain/cli-version.js';
 import { ResourceTooLargeError, WorkspaceConflict, WorldNotRunningError } from '../world/resources.js';
@@ -843,6 +843,17 @@ interface Session {
 function ssoSession(identity: { oidcProviderId?: string; ssoAvailable: boolean } | undefined) {
   return identity?.oidcProviderId
     ? { providerId: identity.oidcProviderId, ...(identity.ssoAvailable ? {} : { unavailable: true }) } : null;
+}
+
+/** `merge` of an offline edit's write: where and when it was made, for a copy's name; undefined when malformed. */
+function offlineEditOrigin(raw: unknown): OfflineEditOrigin | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return raw === true ? {} : undefined;
+  const value = raw as Record<string, unknown>;
+  if (value.device !== undefined && typeof value.device !== 'string') return undefined;
+  if (value.at !== undefined && !Number.isFinite(value.at)) return undefined;
+  if (value.tz !== undefined && !Number.isFinite(value.tz)) return undefined;
+  return { ...(value.device ? { device: String(value.device).slice(0, 80) } : {}), ...(value.at !== undefined ? { at: Number(value.at) } : {}),
+    ...(value.tz !== undefined ? { tz: Number(value.tz) } : {}) };
 }
 
 export class Gateway {
@@ -5931,12 +5942,23 @@ export class Gateway {
           const refusal = view.kind === 'task' && !(await this.sessionMay(session, 'task:edit', projectId, view.taskId))
             ? 'Changing a task’s files needs task:edit on it.' : undefined;
           if (refusal) return this.json(res, 403, { error: refusal });
+          // An edit made offline (wiki features/offline-files § Offline edits): one write, merged if it changed meanwhile.
+          const merging = list.some((raw: any) => raw?.merge !== undefined);
+          const origin = merging ? offlineEditOrigin(list[0]?.merge) : undefined;
+          if (merging && (list.length !== 1 || changes[0]!.op !== 'write' || typeof (changes[0] as { expect?: unknown }).expect !== 'string' || !origin || view.kind === 'task'))
+            return this.json(res, 400, { error: 'merge is one write of the default or a branch view, with expect: the version it started from, and merge: {device?, at?, tz?}' });
           const data = (await this.deps.tokens.check(session.apiToken, 'project:settings:read', { projectId })).ok;
-          const result = await this.fileChanges(() => actorPrincipal(callerIdentity.actor)).apply(projectId, view, changes, await this.commitAuthor(session), {
-            data, mayCommit: async (branch) => (await this.deps.tokens.check(session.apiToken, `merge-into:${branch}`, { projectId })).ok,
-            mayKeep: async () => (await this.deps.tokens.check(session.apiToken, 'project:settings:write', { projectId })).ok });
+          const applyOptions = {
+            data, mayCommit: async (branch: string) => (await this.deps.tokens.check(session.apiToken, `merge-into:${branch}`, { projectId })).ok,
+            mayKeep: async () => (await this.deps.tokens.check(session.apiToken, 'project:settings:write', { projectId })).ok };
+          const changer = this.fileChanges(() => actorPrincipal(callerIdentity.actor));
+          const author = await this.commitAuthor(session);
+          const result = origin
+            ? await changer.applyOffline(projectId, view, changes[0] as Extract<FileChange, { op: 'write' }>, origin, author, applyOptions)
+            : await changer.apply(projectId, view, changes, author, applyOptions);
           await this.deps.authorization?.audit(actorPrincipal(callerIdentity.actor), 'files.change', `project:${projectId}`,
-            { view, changes: changes.map((change) => ({ op: change.op, ...('path' in change ? { path: change.path } : { from: change.from, to: change.to }) })), commits: result.commits });
+            { view, changes: changes.map((change) => ({ op: change.op, ...('path' in change ? { path: change.path } : { from: change.from, to: change.to }) })), commits: result.commits,
+              ...('merge' in result ? { merge: result.merge } : {}) });
           return this.json(res, 200, result);
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);

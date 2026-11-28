@@ -349,4 +349,23 @@ test('the bridge answers only the console\'s top frame and passes {code, message
     assert.deepEqual(fs.readdirSync(path.join(dir, 'tmp')), []);
     assert.throws(() => store.read({ hash: '../x' }), { code: 'invalid' });
   });
+
+  test('offline edits: the outbox’s copy outlives a wipe of the bytes, and leaves only when dropped', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tavya-offline-edits-test-'));
+    const store = createOfflineStore({ dir: path.join(root, 'offline-files'), origin: ORIGIN, editsDir: path.join(root, 'offline-edits'), request: async () => ({}) });
+    const entry = JSON.stringify({ id: 'p||site/a.md', name: 'a.md', content: 'mine\n', rev: 1 });
+    store.saveEdit({ id: 'p||site/a.md', entry });
+    store.saveEdit({ id: 'p||site/a.md', entry: entry.replace('"rev":1', '"rev":2') });
+    assert.deepEqual(store.edits().edits.map((json) => JSON.parse(json).rev), [2]);
+    store.wipe();
+    assert.equal(store.edits().edits.length, 1);
+    const opened = store.editToOpen({ id: 'p||site/a.md', name: 'a.md' });
+    assert.equal(path.basename(opened), 'a.md');
+    assert.equal(fs.readFileSync(opened, 'utf8'), 'mine\n');
+    assert.ok(!(fs.statSync(path.join(root, 'offline-edits')).mode & 0o077));
+    store.dropEdit({ id: 'p||site/a.md' });
+    assert.deepEqual(store.edits().edits, []);
+    assert.throws(() => store.saveEdit({ id: 'x' }), { code: 'invalid' });
+    assert.ok(createOfflineStore({ dir: path.join(root, 'u', 'offline-files'), origin: ORIGIN, request: async () => ({}) }).edits().edits.length === 0);
+  });
 }

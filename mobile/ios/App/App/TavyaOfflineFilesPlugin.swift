@@ -14,6 +14,11 @@ import WebKit
 ///   url({hash}) → {url: null}: WKWebView can't answer https itself, so the
 ///     page reads the bytes in 1 MiB chunks with read()
 ///   read({hash, offset, length}) → {data: base64, eof} · open({hash, name})
+///   saveEdit({id, entry}) · edits() → {edits: [entry]} · dropEdit({id}) ·
+///   openEdit({id, name}): the native copy of the outbox of edits made offline
+///     (§ Offline edits), one JSON file per edit in Application
+///     Support/offline-edits — outside offline-files, so wipe() (signing out)
+///     never takes an edit not uploaded yet, nor can a cleared WebView storage.
 ///
 /// Bytes live in Application Support, excluded from backup, with
 /// NSFileProtectionCompleteUntilFirstUserAuthentication. A download goes
@@ -32,7 +37,11 @@ public class TavyaOfflineFilesPlugin: CAPPlugin, CAPBridgedPlugin, UIDocumentInt
         CAPPluginMethod(name: "wipe", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "url", returnType: CAPPluginReturnPromise),
         CAPPluginMethod(name: "read", returnType: CAPPluginReturnPromise),
-        CAPPluginMethod(name: "open", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "open", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "saveEdit", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "edits", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "dropEdit", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "openEdit", returnType: CAPPluginReturnPromise)
     ]
 
     static let maxChunkBytes = 1024 * 1024
@@ -45,6 +54,14 @@ public class TavyaOfflineFilesPlugin: CAPPlugin, CAPBridgedPlugin, UIDocumentInt
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("offline-files", isDirectory: true)
     }
     private var blobs: URL { root.appendingPathComponent("blobs", isDirectory: true) }
+    private var editsFolder: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("offline-edits", isDirectory: true)
+    }
+
+    private func editFile(_ id: String?) throws -> URL {
+        guard let id, !id.isEmpty else { throw Refusal(code: "invalid", message: "An edit needs an id.") }
+        return editsFolder.appendingPathComponent(hex(SHA256.hash(data: Data(id.utf8))) + ".json")
+    }
 
     private func blob(_ hash: String?) throws -> URL {
         guard let hash, hash.count == 64, hash.allSatisfy({ "0123456789abcdef".contains($0) }) else { throw Refusal(code: "invalid", message: "Not a stored file.") }
@@ -191,25 +208,77 @@ public class TavyaOfflineFilesPlugin: CAPPlugin, CAPBridgedPlugin, UIDocumentInt
         } catch let refusal as Refusal { reject(call, refusal) } catch { call.reject("Couldn’t read the copy.", "missing") }
     }
 
+    // MARK: the outbox's native copy
+
+    @objc func saveEdit(_ call: CAPPluginCall) {
+        do {
+            guard let entry = call.getString("entry") else { throw Refusal(code: "invalid", message: "An edit needs its entry.") }
+            let target = try editFile(call.getString("id"))
+            let manager = FileManager.default
+            if !manager.fileExists(atPath: editsFolder.path) {
+                try manager.createDirectory(at: editsFolder, withIntermediateDirectories: true,
+                                            attributes: [.protectionKey: FileProtectionType.completeUntilFirstUserAuthentication])
+                var values = URLResourceValues()
+                values.isExcludedFromBackup = true
+                var folder = editsFolder
+                try folder.setResourceValues(values)
+            }
+            // Written whole, then put in place of the last copy (.atomic).
+            try Data(entry.utf8).write(to: target, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            call.resolve()
+        } catch { reject(call, error) }
+    }
+
+    @objc func edits(_ call: CAPPluginCall) {
+        let names = (try? FileManager.default.contentsOfDirectory(atPath: editsFolder.path)) ?? []
+        var list: [String] = []
+        for name in names where name.count == 69 && name.hasSuffix(".json") {
+            if let data = try? Data(contentsOf: editsFolder.appendingPathComponent(name)), let entry = String(data: data, encoding: .utf8) { list.append(entry) }
+        }
+        call.resolve(["edits": list])
+    }
+
+    @objc func dropEdit(_ call: CAPPluginCall) {
+        do {
+            let file = try editFile(call.getString("id"))
+            try? FileManager.default.removeItem(at: file)
+            call.resolve()
+        } catch { reject(call, error) }
+    }
+
+    /// Open in… for an edit: its content under its file's name.
+    @objc func openEdit(_ call: CAPPluginCall) {
+        do {
+            let data = try Data(contentsOf: try editFile(call.getString("id")))
+            let entry = (try JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+            let content = Data(((entry["content"] as? String) ?? "").utf8)
+            try present(call, name: call.getString("name") ?? (entry["name"] as? String) ?? "file") { copy in try content.write(to: copy) }
+        } catch { reject(call, error) }
+    }
+
     /// Open in…: a copy with its real name, offered to Quick Look and the apps that open it.
     @objc func open(_ call: CAPPluginCall) {
         do {
             let source = try blob(call.getString("hash"))
-            let name = (call.getString("name") ?? "file").replacingOccurrences(of: "/", with: "_")
-            let folder = FileManager.default.temporaryDirectory.appendingPathComponent("offline-open", isDirectory: true)
-            try? FileManager.default.removeItem(at: folder)
-            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-            let copy = folder.appendingPathComponent(name.isEmpty ? "file" : name)
-            try FileManager.default.copyItem(at: source, to: copy)
-            DispatchQueue.main.async {
-                guard let view = self.bridge?.viewController?.view else { return call.reject("No window.", "failed") }
-                let controller = UIDocumentInteractionController(url: copy)
-                controller.delegate = self
-                self.documents = controller
-                let anchor = CGRect(x: view.bounds.midX, y: view.bounds.maxY - 1, width: 1, height: 1)
-                if controller.presentOptionsMenu(from: anchor, in: view, animated: true) { call.resolve() } else { call.reject("No app on this phone opens this file.", "unavailable") }
-            }
+            try present(call, name: call.getString("name") ?? "file") { copy in try FileManager.default.copyItem(at: source, to: copy) }
         } catch { reject(call, error) }
+    }
+
+    private func present(_ call: CAPPluginCall, name requested: String, write: (URL) throws -> Void) throws {
+        let name = requested.replacingOccurrences(of: "/", with: "_")
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("offline-open", isDirectory: true)
+        try? FileManager.default.removeItem(at: folder)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        let copy = folder.appendingPathComponent(name.isEmpty ? "file" : name)
+        try write(copy)
+        DispatchQueue.main.async {
+            guard let view = self.bridge?.viewController?.view else { return call.reject("No window.", "failed") }
+            let controller = UIDocumentInteractionController(url: copy)
+            controller.delegate = self
+            self.documents = controller
+            let anchor = CGRect(x: view.bounds.midX, y: view.bounds.maxY - 1, width: 1, height: 1)
+            if controller.presentOptionsMenu(from: anchor, in: view, animated: true) { call.resolve() } else { call.reject("No app on this phone opens this file.", "unavailable") }
+        }
     }
 
     public func documentInteractionControllerViewControllerForPreview(_ controller: UIDocumentInteractionController) -> UIViewController {

@@ -480,6 +480,8 @@
   "tests/object-store-deferred-delete.test.ts": 9.1,
   "tests/object-store-migrate.test.ts": 1.6,
   "tests/object-store-s3.test.ts": 0.1,
+  "tests/offline-edits.browser.test.ts": 20.4,
+  "tests/offline-edits.test.ts": 19.5,
   "tests/offline-files.browser.test.ts": 12.4,
   "tests/offline-files.electron.test.ts": 0,
   "tests/offline-files.test.ts": 17.6,
