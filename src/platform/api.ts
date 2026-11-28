@@ -1858,11 +1858,8 @@ export class KarmaxApi {
     // active account later must not silently change an existing task's commit or
     // pull-request actor.
     const avatarGithubAccountId = selectedAvatars.find(({ role }) => role === 'do')?.avatar.githubAccountId;
-    const githubAccountId = avatarGithubAccountId ?? (caller.kind === 'agent'
-      ? caller.externalIdentities?.githubAccountId
-      : caller.humanSubject
-        ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId))
-        : undefined);
+    const newAccount = avatarGithubAccountId ? { githubAccountId: avatarGithubAccountId } : (await this.newTaskGithubAccount(caller));
+    const githubAccountId = newAccount.githubAccountId;
     // Human routing belongs to each workflow confirm layer. Keep accepting the
     // old task-level policy only for API/backward compatibility; the UI never
     // creates one and new workflows publish their current audience with the wait.
@@ -1932,6 +1929,7 @@ export class KarmaxApi {
         organizationId: authorizationScope.scope === 'global' ? undefined
           : (authorizationScope.organizationId ?? project.organizationId),
         externalIdentities: githubAccountId ? { githubAccountId } : undefined,
+        githubAccountChosenByPerson: newAccount.chosenByPerson,
       }));
       if (delegation) {
         (await this.deps.store.updateTaskParams(task.id, {
@@ -3126,12 +3124,8 @@ export class KarmaxApi {
     // already-pinned account with the caller's currently-active account.
     const pinnedGithubAccountId = typeof task.params?._githubAccountId === 'string'
       ? task.params._githubAccountId : undefined;
-    const delegatedGithubAccountId = pinnedGithubAccountId
-      ?? (caller.kind === 'agent'
-        ? caller.externalIdentities?.githubAccountId
-        : caller.humanSubject
-          ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId))
-          : undefined);
+    const newAccount = pinnedGithubAccountId ? { githubAccountId: pinnedGithubAccountId } : (await this.newTaskGithubAccount(caller));
+    const delegatedGithubAccountId = newAccount.githubAccountId;
     const delegation = (await this.delegateTaskHuman(token, caller, {
       taskId,
       projectId: authorizationScope.scope ? undefined : task.projectId,
@@ -3139,6 +3133,7 @@ export class KarmaxApi {
       organizationId: authorizationScope.scope === 'global' ? undefined
         : (authorizationScope.organizationId ?? organizationId),
       externalIdentities: delegatedGithubAccountId ? { githubAccountId: delegatedGithubAccountId } : undefined,
+      githubAccountChosenByPerson: newAccount.chosenByPerson,
     }));
     if (!editInPlace) {
       // The workflow validator is the single source of truth for the in-flight
@@ -3516,6 +3511,24 @@ export class KarmaxApi {
    * the selected scope. Preserve that wider authorization when the browser's
    * short-lived API token is intentionally narrowed to the current route's
    * project; non-human callers still attenuate strictly from their bearer. */
+  /**
+   * The GitHub account a new task acts as — its commits, pull requests and
+   * merges: the person's active account now (Profile → GitHub, "Use"), whether
+   * they create the task or an agent acting for them does. The task keeps it
+   * (`_githubAccountId`), so a later switch never moves work under way; a
+   * sub-task shares its parent's (deriveHumanDelegation); an Avatar's fork acts
+   * as the Avatar's. An agent's own pin is only the fallback when the person's
+   * choice cannot be read: a long-lived agent (a CEO) handing down the account
+   * it started with kept every task it made on an account the person had left
+   * (#1070).
+   */
+  private async newTaskGithubAccount(caller: ScopedToken): Promise<{ githubAccountId?: string; chosenByPerson?: boolean }> {
+    const chosen = caller.humanSubject
+      ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)) : undefined;
+    if (chosen) return { githubAccountId: chosen, chosenByPerson: true };
+    return { githubAccountId: caller.kind === 'agent' ? caller.externalIdentities?.githubAccountId : undefined };
+  }
+
   private async delegateTaskHuman(token: string, caller: ScopedToken, args: HumanDelegationArgs) {
     return this.deps.authorization && caller.kind === 'human' && caller.principal.startsWith('user:')
       ? (await this.deps.tokens.delegateAuthorizedInteractiveHuman(token, args))
@@ -6402,11 +6415,11 @@ Resolve the request exactly once by calling platform_request with POST /api/perm
     const scope = (await baseTaskAuthority(this.deps.store, this.deps.authorization,
       { ...task, params: { ...task.params, _authorization: authorization } }));
     const pinned = typeof task.params._githubAccountId === 'string' ? task.params._githubAccountId : undefined;
-    const githubAccountId = pinned ?? (caller.kind === 'agent' ? caller.externalIdentities?.githubAccountId
-      : caller.humanSubject ? (await this.deps.githubApp?.activeUserAccountId(caller.humanSubject.userId)) : undefined);
+    const account = pinned ? { githubAccountId: pinned } : (await this.newTaskGithubAccount(caller));
     const delegation = (await this.delegateTaskHuman(token, caller, { taskId: task.id,
       ...tokenScopeOf(scope, task.projectId, organizationId),
-      ...(githubAccountId ? { externalIdentities: { githubAccountId } } : {}) }));
+      ...(account.githubAccountId ? { externalIdentities: { githubAccountId: account.githubAccountId } } : {}),
+      githubAccountChosenByPerson: account.chosenByPerson }));
     (await this.deps.store.patchTaskParams(task.id, { _authorization: { ...authorization,
       ...(delegation ? { delegationId: delegation.id } : {}) } }));
   }
@@ -9922,9 +9935,11 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
       createdBy: await this.taskCreator(caller, project.id),
       ...(await this.creationVia(caller)),
     }));
+    const workflowAccount = (await this.newTaskGithubAccount(caller));
     const workflowDelegation = (await this.deps.tokens.delegateHuman(token, {
       taskId: task.id, projectId: task.projectId, organizationId: project.organizationId,
-      externalIdentities: caller.externalIdentities,
+      externalIdentities: workflowAccount.githubAccountId ? { githubAccountId: workflowAccount.githubAccountId } : caller.externalIdentities,
+      githubAccountChosenByPerson: workflowAccount.chosenByPerson,
     }));
     if (workflowDelegation) {
       (await this.deps.store.updateTaskParams(task.id, { ...task.params,

@@ -33,6 +33,9 @@ export interface HumanDelegation {
   projectIds?: string[];
   organizationId?: string;
   externalIdentities?: ExternalIdentityClaims;
+  /** Its GitHub account is the person's own choice (their active account when
+   * the task was made), not the one of the agent it was derived from. */
+  githubAccountChosenByPerson?: true;
   parentDelegationId?: string;
   issuedAt: number;
   expiresAt: number;
@@ -66,6 +69,11 @@ export interface HumanDelegationArgs {
   projectIds?: string[];
   organizationId?: string;
   externalIdentities?: ExternalIdentityClaims;
+  /** `externalIdentities.githubAccountId` is the person's active account, read
+   * by host code (`GitHubAppService.activeUserAccountId`), never an agent's
+   * input: an agent creating a task for them may then name it although its own
+   * delegation pinned another of their accounts. */
+  githubAccountChosenByPerson?: boolean;
   ttlMs?: number;
 }
 
@@ -193,7 +201,8 @@ export class TokenAuthority {
       const parentProjects = projectsOf(parent);
       if (parentProjects.length && (!recordProjects.length
         || recordProjects.some((projectId) => !parentProjects.includes(projectId)))) return undefined;
-      if (record.externalIdentities?.githubAccountId !== parent.externalIdentities?.githubAccountId) return undefined;
+      if (!record.githubAccountChosenByPerson
+        && record.externalIdentities?.githubAccountId !== parent.externalIdentities?.githubAccountId) return undefined;
       if (record.expiresAt > parent.expiresAt) return undefined;
     }
     return record;
@@ -286,14 +295,22 @@ export class TokenAuthority {
 
   /** Pin a human subject to a task from an already verified bearer. For an
    * interactive human, the external identity was selected by trusted host code;
-   * an agent may only inherit its existing pinned identity unchanged. */
+   * an agent may only inherit its existing pinned identity unchanged, or carry
+   * the person's own active account that host code read for it
+   * (`githubAccountChosenByPerson`). */
   async delegateHuman(token: string, args: HumanDelegationArgs): Promise<HumanDelegation | undefined> {
     const parent = (await this.verify(token));
     if (!parent?.humanSubject) return undefined;
     this.assertScopeWithin(parent, args);
-    if (parent.kind === 'agent' && args.externalIdentities?.githubAccountId !== parent.externalIdentities?.githubAccountId)
+    const chosenByPerson = parent.kind === 'agent' && args.githubAccountChosenByPerson === true
+      && !!args.externalIdentities?.githubAccountId
+      && args.externalIdentities.githubAccountId !== parent.externalIdentities?.githubAccountId;
+    if (parent.kind === 'agent' && !chosenByPerson
+      && args.externalIdentities?.githubAccountId !== parent.externalIdentities?.githubAccountId)
       throw new Error('an agent cannot substitute a delegated GitHub account');
-    return (await this.issueDelegation({ ...args, humanUserId: parent.humanSubject.userId,
+    const { githubAccountChosenByPerson: _chosen, ...delegated } = args;
+    return (await this.issueDelegation({ ...delegated, humanUserId: parent.humanSubject.userId,
+      ...(chosenByPerson ? { githubAccountChosenByPerson: true as const } : {}),
       externalIdentities: args.externalIdentities ?? parent.externalIdentities,
       parentDelegationId: parent.delegationId,
       maxExpiresAt: parent.delegationId ? (await this.delegation(parent.delegationId))?.expiresAt : undefined }));
@@ -311,7 +328,8 @@ export class TokenAuthority {
     if (!parent?.humanSubject) return undefined;
     if (parent.kind !== 'human' || parent.humanSubject.presence !== 'interactive')
       throw new Error('authorized delegation requires an interactive human');
-    return (await this.issueDelegation({ ...args, humanUserId: parent.humanSubject.userId,
+    const { githubAccountChosenByPerson: _root, ...delegated } = args;
+    return (await this.issueDelegation({ ...delegated, humanUserId: parent.humanSubject.userId,
       externalIdentities: args.externalIdentities ?? parent.externalIdentities }));
   }
 
@@ -321,7 +339,8 @@ export class TokenAuthority {
    * to their tavya account (src/integrations/chat-links.ts), and has already
    * cut the run's grant to what they hold. Never reachable from a request. */
   async delegateLinkedPerson(userId: string, args: HumanDelegationArgs): Promise<HumanDelegation> {
-    return this.issueDelegation({ ...args, humanUserId: userId });
+    const { githubAccountChosenByPerson: _root, ...delegated } = args;
+    return this.issueDelegation({ ...delegated, humanUserId: userId });
   }
 
   /** Derive a child-task delegation from durable parent provenance. This is used
@@ -338,7 +357,8 @@ export class TokenAuthority {
 
   private async issueDelegation(args: {
     taskId: string; humanUserId: string; projectId?: string; projectIds?: string[]; organizationId?: string;
-    externalIdentities?: ExternalIdentityClaims; parentDelegationId?: string; ttlMs?: number; maxExpiresAt?: number;
+    externalIdentities?: ExternalIdentityClaims; githubAccountChosenByPerson?: true; parentDelegationId?: string;
+    ttlMs?: number; maxExpiresAt?: number;
   }): Promise<HumanDelegation> {
     const issuedAt = Date.now();
     const expiresAt = Math.min(args.ttlMs ? issuedAt + args.ttlMs : DELEGATION_NO_EXPIRY, args.maxExpiresAt ?? DELEGATION_NO_EXPIRY);
@@ -346,6 +366,7 @@ export class TokenAuthority {
       id: `dlg_${crypto.randomBytes(12).toString('hex')}`, taskId: args.taskId, humanUserId: args.humanUserId,
       projectId: args.projectId, projectIds: args.projectIds?.length ? [...new Set(args.projectIds)] : undefined,
       organizationId: args.organizationId, externalIdentities: args.externalIdentities,
+      ...(args.githubAccountChosenByPerson ? { githubAccountChosenByPerson: true as const } : {}),
       parentDelegationId: args.parentDelegationId, issuedAt, expiresAt,
     };
     if (this.store) (await this.store.putHumanDelegation(record.id, record as unknown as Record<string, unknown>, expiresAt));
