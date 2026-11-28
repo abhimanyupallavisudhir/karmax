@@ -526,8 +526,15 @@ describe('software-dev pipeline: landing, review and the merge queue (real Tempo
       return `${current.stage}/${current.status}/${current.waitingFor?.kind}/${current.waitingFor?.detail}`;
     }, { timeout: 30_000 }).toBe('do/waiting/human/Ship as is?');
     expect((await view(handle)).actions.map((action: any) => action.name)).toContain('openPr');
+    // #1060: a question asked only through pause's message is said in the
+    // conversation, as the agent's own words — which do not wake it.
+    expect((await view(handle)).messages.at(-1)).toMatchObject({ role: 'agent', text: 'Ship as is?' });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect(`${(await view(handle)).status}/${(await view(handle)).waitingFor?.kind}`).toBe('waiting/human');
     await handle.signal('openPr');
     await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    // Its wait is over; the question is still in the record.
+    expect((await view(handle)).messages.some((m: any) => m.role === 'agent' && m.text === 'Ship as is?')).toBe(true);
     await handle.signal('confirm');
     expect(await handle.result()).toMatchObject({ stage: 'done' });
     expect((await git(repo, ['show', 'main:proposal.js'])).stdout).toContain('ready = true');

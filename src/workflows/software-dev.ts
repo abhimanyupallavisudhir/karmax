@@ -389,6 +389,9 @@ const STAGES_WAIT_FOR_CAPACITY = 'stages-wait-for-capacity-v1';
 const CAPACITY_WAIT_ENDS_IN_ASK = 'stages-capacity-wait-ends-in-ask-v1';
 /** A pause a message interrupted goes on after the turn that answered it. */
 const PAUSE_GOES_ON = 'pause-goes-on-after-interruption-v1';
+/** A `needs_input` question asked only through pause's `message` is said in
+ * the conversation, so it (and its form) outlives the wait (#1060). */
+const ASK_IN_CONVERSATION = 'needs-input-asked-in-conversation-v1';
 /** A task whose branches all landed as their own pull requests still reviews
  * the data it changed, instead of finishing and losing it with its world. */
 const SEVERAL_BRANCHES_DATA_REVIEW = 'several-branches-data-review-v1';
@@ -5224,6 +5227,17 @@ Inspect the complete current diff and specifically compare its delta from the re
       const needsInput = pauseWait.needsInput;
       if (!needsInput) await replyUnasked();
       const question = needsInput?.message ?? (turn.output?.trim() || 'The agent paused for your input.');
+      // A question asked only through pause's `message` is said in the
+      // conversation as the main agent's own words, once: there it stays after
+      // the wait, and a form in it shows as answered (ASK_IN_CONVERSATION).
+      let questionSaid = false;
+      const sayQuestion = () => {
+        if (questionSaid || !needsInput?.message || needsInput.message.trim() === turn.output?.trim()) return;
+        questionSaid = true;
+        const caughtUp = !mainUnread();
+        msgs.push({ id: `ask-${msgs.length}`, role: 'agent', text: needsInput.message, ts: Date.now() });
+        if (caughtUp) seen = msgs.length;
+      };
       const routed = !!needsInput && !needsInput.audience?.length;
       const askedParent = routed && await notifyParent('needs_info', question);
       const route = routed && !askedParent && routedInputResponder ? liveResponder : undefined;
@@ -5233,11 +5247,7 @@ Inspect the complete current diff and specifically compare its delta from the re
         waitingFor = { kind: 'responder', detail: question };
         // The Responder reads the conversation, so a question asked only through
         // pause's `message` is said there as the main agent's own words.
-        if (multiAgent && needsInput.message && needsInput.message.trim() !== turn.output?.trim()) {
-          const caughtUp = !mainUnread();
-          msgs.push({ id: `ask-${msgs.length}`, role: 'agent', text: needsInput.message, ts: Date.now() });
-          if (caughtUp) seen = msgs.length;
-        }
+        if (multiAgent) sayQuestion();
         await publish();
         const answer = await responderTurn(route, question);
         waitingFor = undefined;
@@ -5249,6 +5259,7 @@ Inspect the complete current diff and specifically compare its delta from the re
       }
       const rerouted = pendingReroute;
       pendingReroute = undefined;
+      if (needsInput && patched(ASK_IN_CONVERSATION)) sayQuestion();
       // A paused agent can be stopped too: its pause ends without resuming it.
       if (multiAgent) turnOwners.push(MAIN_AGENT);
       const note = await waitForAgent(pauseWait, {

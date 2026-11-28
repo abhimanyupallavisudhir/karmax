@@ -380,6 +380,14 @@ async function justDoImpl(
     // `pause`: resume the agent when it is over.
     if (turn.wait && patched('agent-wait-v1')) {
       const needsInput = turn.wait.needsInput;
+      // A question asked only through pause's `message` is said in the
+      // conversation as the agent's own words: there it outlives the wait, and
+      // a form in it shows as answered (#1060). The agent has read what it wrote.
+      if (needsInput?.message && needsInput.message.trim() !== turn.output?.trim() && patched('needs-input-asked-in-conversation-v1')) {
+        const caughtUp = msgs.length <= seen;
+        msgs.push({ id: `ask-${msgs.length}`, role: 'agent', text: needsInput.message, ts: Date.now() });
+        if (caughtUp) seen = msgs.length;
+      }
       const note = await waitForAgent(turn.wait, {
         world,
         ...(needsInput ? { ask: {

@@ -936,6 +936,60 @@ describe('task stage transitions', () => {
     expect((await f.store.listInbox('developer', 'org_personal'))).toEqual([]);
   });
 
+  /** #1060: an escalated question with a secure form lived only in the wait.
+   * Once its wait was replaced (by a permission request) the question and its
+   * form were gone from the task. Now the agent says it in the conversation. */
+  it('says an escalated question in the conversation, as the agent, without waking it', async () => {
+    const f = (await fixture());
+    const agentToken = (await f.tokens.mint({ taskId: f.task.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${f.task.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    const ask = 'Paste the client below.\n\n```form\n{"title": "Google OAuth client for tavya", "fields": [{"name": "clientId", "label": "Client ID", "type": "text", "placeholder": "….apps.googleusercontent.com"}, {"name": "clientSecret", "label": "Client secret", "type": "secret"}], "submit": "Save", "save": {"method": "PUT", "path": "/api/settings/oauth-apps/accounts.google.com", "body": {"clientId": "{{clientId}}", "clientSecret": "{{clientSecret}}"}}}\n```';
+    (await f.api.escalateToHuman(agentToken, { audience: ['@creator'], message: ask, urgency: 'high' }));
+    const recovery = f.starts.at(-1)!.options.args[0].recovery;
+    const said = recovery.messages.at(-1);
+    expect(said).toMatchObject({ role: 'agent', text: ask });
+    expect(said.id).toMatch(/^ask-/);
+    expect(said.author).toBeUndefined(); // a conversation from before several agents
+    // The agent wrote it, so it has read it: the replacement does not wake it.
+    expect(recovery.seen).toBe(recovery.messages.length);
+    expect(recovery.humanWait).toEqual({ audience: ['@creator'], detail: ask });
+    // Open pages show it at once.
+    expect((await f.store.eventsSince(f.task.id, 0))).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'conversation.message', payload: { role: 'do', message: said } }),
+    ]));
+
+    // In a shared conversation it is the main agent's, to whom it asks.
+    const shared = (await f.store.createTask({ projectId: f.project.id, title: 'Shared', workflow: 'software-dev',
+      workflowVersion: '1.27.0', createdBy: { kind: 'user', userId: 'test' }, params: { prompt: 'work', base: 'main', target: 'main' } }));
+    const sharedView = { ...f.view, taskId: shared.id, participants: [{ key: 'do', label: 'Agent', role: 'do', state: 'running', messages: 1 }] } as TaskView;
+    (await f.store.saveView(shared.id, sharedView));
+    f.setLiveView(sharedView);
+    const sharedAgent = (await f.tokens.mint({ taskId: shared.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${shared.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    (await f.api.escalateToHuman(sharedAgent, { audience: ['@creator'], message: ask }));
+    expect(f.starts.at(-1)!.options.args[0].recovery.messages.at(-1)).toMatchObject({ role: 'agent', author: 'do', to: ['@creator'], text: ask });
+
+    // A question the agent's last message already says is not said twice; an
+    // agent behind on its messages still reads the ones it has not.
+    const again = (await f.store.createTask({ projectId: f.project.id, title: 'Again', workflow: 'software-dev',
+      workflowVersion: '1.4.0', createdBy: { kind: 'user', userId: 'test' }, params: { prompt: 'work', base: 'main', target: 'main' } }));
+    const behind: TaskView = { ...f.view, taskId: again.id, messages: [...f.view.messages,
+      { id: 'a1', role: 'agent', text: 'Which region?', ts: 1 }, { id: 'u2', role: 'user', text: 'Also: hurry.', ts: 2 }], state: { turnsSeen: 2 } };
+    (await f.store.saveView(again.id, behind));
+    f.setLiveView(behind);
+    const againAgent = (await f.tokens.mint({ taskId: again.id, profileId: 'do', role: 'do',
+      principal: `task-agent:${again.id}:do`, projectId: f.project.id, ceiling: ['task:escalate'], grantorCaps: ['task:escalate'] })).token;
+    (await f.api.escalateToHuman(againAgent, { audience: ['@creator'], message: 'Which colour?' }));
+    expect(f.starts.at(-1)!.options.args[0].recovery).toMatchObject({ seen: 2 });
+    expect(f.starts.at(-1)!.options.args[0].recovery.messages.map((m: { id: string }) => m.id)).toEqual(['m0', 'a1', 'u2', expect.stringMatching(/^ask-/)]);
+    const startsBefore = f.starts.length;
+    f.setLiveView({ ...behind, messages: behind.messages.slice(0, 2), state: { turnsSeen: 2 } });
+    (await f.api.escalateToHuman(againAgent, { audience: ['@creator'], message: 'Which region?' }));
+    expect(f.starts.length).toBe(startsBefore + 1);
+    expect(f.starts.at(-1)!.options.args[0].recovery.messages.map((m: { id: string }) => m.id)).toEqual(['m0', 'a1']);
+    f.setLiveView(undefined);
+  });
+
   /** #533: a sub-task's escalate_to_human named nobody, and the default sent it
    * past its parent to the person at the top of the creator chain. An ask a
    * person must answer names them; the error lists who can be asked. */

@@ -363,6 +363,23 @@ describe('the v1 workflow family (real Temporal + git, mock agent)', () => {
     await dev.signal('cancel');
   }, 90_000);
 
+  /** #1060: a needs_input question asked only through pause's message lived in
+   * the wait alone, and with it any form it held: gone once the wait ended. */
+  it('just-do says a needs_input question in the conversation, without waking its agent', async () => {
+    const taskId = newId('task');
+    const handle = await h.client.workflow.start('justDo', { taskQueue: TASK_QUEUE, workflowId: taskId,
+      args: [{ ...baseInput(taskId, await h.makeRepo('ask'), { title: 'ask', prompt: 'Start.\n@pause 30 :: input -- Which bucket region?' }), waitMinuteMs: 60_000 }] });
+    await expect.poll(async () => `${(await view(handle)).waitingFor?.kind}/${(await view(handle)).waitingFor?.detail}`, { timeout: 30_000 })
+      .toBe('human/Which bucket region?');
+    expect((await view(handle)).messages.at(-1)).toMatchObject({ role: 'agent', text: 'Which bucket region?' });
+    await new Promise((resolve) => setTimeout(resolve, 1_500));
+    expect((await view(handle)).waitingFor?.kind).toBe('human');
+    await handle.signal('followUp', { id: 'answer', role: 'user', text: 'eu-west-1', ts: Date.now() }, 'do');
+    await expect.poll(async () => (await view(handle)).stage, { timeout: 30_000 }).toBe('review');
+    expect((await view(handle)).messages.filter((m: any) => m.text === 'Which bucket region?')).toEqual([expect.objectContaining({ role: 'agent' })]);
+    await handle.signal('cancel');
+  }, 60_000);
+
   it('goal: completes and merges without a human review gate', async () => {
     const repo = await h.makeRepo('goal');
     const taskId = newId('task');
