@@ -150,6 +150,8 @@ export function projectRepositoryCredential(store: Store, options: { hosted?: bo
 const TIP_MAX_AGE_MS = 30_000;
 /** At most this many files are kept offline under one pin (a folder's manifest). */
 export const MANIFEST_MAX_FILES = 20_000;
+/** How many of a data resource's versions are searched for an offline edit's base. */
+const VERSION_SEARCH = 100;
 /** restic runs at once while a manifest walks a data folder's trees. */
 const TREE_READS = 4;
 /** A live file larger than this is not read through a provider that cannot stream. */
@@ -242,6 +244,48 @@ export class ProjectFiles {
       files: [{ path: '', size: place.size ?? 0, version: place.revision, ...(place.data ? { data: true as const } : {}) }], bytes: place.size ?? 0 };
     files.sort((a, b) => collator.compare(a.path, b.path) || (a.path < b.path ? -1 : 1));
     return { path: place.path, kind: 'directory', revision: place.revision, files, bytes: files.reduce((sum, file) => sum + file.size, 0) };
+  }
+
+  /** The bytes the file at `relative` had at `version` (as Files and the
+   * manifest name versions), if tavya still has them: a Git blob by its id,
+   * read from the mirror of the repository holding the path; a data file by
+   * its content identity, from the newest of the resource's last
+   * VERSION_SEARCH versions that has it there. What an offline edit is merged
+   * from (wiki features/offline-files § Offline edits). The default or a
+   * branch view; none over `maxBytes`. */
+  async versionBytes(projectId: string, relative: string, version: string, options: FileReadOptions, maxBytes: number): Promise<Buffer | undefined> {
+    if (options.view?.kind === 'task') return undefined;
+    const segments = splitPath(relative);
+    const layout = await this.projectLayout(projectId, options);
+    const mount = layout.mounts.filter((candidate) => startsWith(segments, candidate.segments)).sort((a, b) => b.segments.length - a.segments.length)[0];
+    if (mount) {
+      if (!options.data) throw new FileAccessError('Viewing data needs access to project settings (project:settings:read).');
+      const inside = segments.slice(mount.segments.length);
+      if (mount.shape === 'file' ? inside.length : !inside.length) return undefined;
+      const revisions = (await this.deps.store.listResourceRevisions(mount.id)).filter((revision) => revision.engine === RESTIC_ENGINE).slice(0, VERSION_SEARCH);
+      for (const revision of revisions) {
+        const at = await this.dataVersion({ ...mount, revisionId: revision.id }).catch(() => undefined);
+        const snapshot = at?.snapshotOf(mount.shape === 'file' ? [] : inside);
+        if (!at || !snapshot) continue;
+        const entry = mount.shape === 'file' ? await this.onlyFile(at.repository, snapshot)
+          : (await this.listing(at.repository, snapshot, inside.slice(0, -1).join('/')).catch(() => [])).find((candidate) => candidate.name === inside.at(-1));
+        if (entry?.type !== 'file' || entry.identity !== version) continue;
+        if ((entry.size ?? 0) > maxBytes) return undefined;
+        const opened = await this.deps.resources!.restic.open(at.repository, snapshot, mount.shape === 'file' ? entry.name : inside.join('/'));
+        return await readAll(opened.stream, opened.done);
+      }
+      return undefined;
+    }
+    const checkout = layout.checkouts.filter((candidate) => startsWith(segments, candidate.segments)).sort((a, b) => b.segments.length - a.segments.length)[0];
+    if (!checkout || !/^[0-9a-f]{40}(?:[0-9a-f]{24})?$/.test(version)) return undefined;
+    return this.withRepository(projectId, checkout, async (mirror) => {
+      const kind = await git(mirror, ['cat-file', '-t', version]);
+      if (kind.code !== 0 || kind.stdout.trim() !== 'blob') return undefined;
+      const size = Number((await git(mirror, ['cat-file', '-s', version])).stdout.trim());
+      if (!(size <= maxBytes)) return undefined;
+      const blob = catBlob(mirror, version);
+      return readAll(blob.stream, blob.done);
+    });
   }
 
   /** What a pinned place is now, without listing it: a file's version, or a
@@ -957,6 +1001,14 @@ function walkTrees(roots: Array<{ id: string; at: string[] }>, read: (id: string
     };
     pump();
   });
+}
+
+/** A stream's bytes, once it and its producer are done. */
+async function readAll(stream: Readable, done: Promise<void>): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  await done;
+  return Buffer.concat(chunks);
 }
 
 /** An async source of bytes as an OpenedFile; `stop` abandons it. */

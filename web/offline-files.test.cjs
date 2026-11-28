@@ -31,10 +31,17 @@ function world({ free = Infinity } = {}) {
     const revision = kind === 'file' ? files[0].version : sha(JSON.stringify(files) + revisionSalt).slice(0, 40);
     return { path: place, kind, revision, files, bytes: files.reduce((sum, file) => sum + file.size, 0) };
   };
-  const server = { forbidden: false, down: false, requests: [] };
+  const server = { forbidden: false, down: false, requests: [], writes: [], refuse: null, merge: null, during: null };
   const request = async (path, opts = {}) => {
     server.requests.push(path);
     if (server.down) throw new TypeError('Failed to fetch');
+    if (/\/files\/changes/.test(path)) {
+      const { changes } = JSON.parse(opts.body);
+      server.writes.push({ path, change: changes[0] });
+      if (server.during) { const during = server.during; server.during = null; await during(); }
+      if (server.refuse) throw Object.assign(new Error(server.refuse.message), { status: server.refuse.status });
+      return { commits: [], ...(changes[0].merge ? { merge: server.merge || { result: 'saved', path: changes[0].path } } : {}) };
+    }
     if (path.startsWith('/api/offline-files/check')) {
       const { pins } = JSON.parse(opts.body);
       return { checkedAt: 1000, results: pins.map((pin) => {
@@ -69,9 +76,20 @@ function world({ free = Infinity } = {}) {
     async remove({ hashes }) { for (const hash of hashes) stored.delete(hash); },
     async wipe() { stored.clear(); },
     async url({ hash }) { return { url: stored.has(hash) ? `local://${hash}` : null }; },
+    // The native copy of the outbox.
+    nativeEdits: new Map(),
+    async saveEdit({ id, entry }) { plugin.nativeEdits.set(id, entry); },
+    async edits() { return { edits: [...plugin.nativeEdits.values()] }; },
+    async dropEdit({ id }) { plugin.nativeEdits.delete(id); },
   };
-  const engine = load().create({ plugin, request, origin: 'https://tavya.test', store: load().memoryStore(), now: () => 500, kind: 'phone' });
-  return { tree, stored, plugin, server, engine, bump: () => { revisionSalt++; } };
+  const told = [];
+  let store = load().memoryStore();
+  const make = () => load().create({ plugin, request, origin: 'https://tavya.test', store, now: () => 500, kind: 'phone', device: () => 'Pixel 8',
+    told: (result, edit) => told.push({ result, path: edit.path }) });
+  const w = { tree, stored, plugin, server, engine: make(), told, bump: () => { revisionSalt++; },
+    // The app starts again; `wiped`: with its WebView's storage cleared.
+    restart: (wiped = false) => { if (wiped) store = load().memoryStore(); w.engine = make(); return w.engine; } };
+  return w;
 }
 
 test('a pinned folder downloads each file once, and two pins share what they have in common', async () => {
@@ -200,4 +218,97 @@ test('a file the device lost is fetched again', async () => {
   await w.engine.sync();
   assert.ok(w.stored.has(sha('alpha')));
   assert.equal(w.engine.get('p||site').state, 'current');
+});
+
+test('an edit saved offline waits in both homes, survives a restart and a wiped WebView, and uploads with its base', async () => {
+  const w = world();
+  await w.engine.ensureOwner('u1');
+  w.server.down = true;
+  const edit = await w.engine.saveEdit({ projectId: 'p', path: 'site/notes.md', base: 'v1', content: 'mine\n', name: 'notes.md' });
+  assert.equal(edit.device, 'Pixel 8');
+  await w.engine.sync();
+  assert.equal(w.engine.edits().length, 1);
+  assert.equal(w.plugin.nativeEdits.size, 1);
+  // Started again, and again with IndexedDB gone: the native copy brings it back.
+  await w.restart().ensureOwner('u1');
+  assert.equal(w.engine.editFor('p', '', 'site/notes.md').content, 'mine\n');
+  await w.restart(true).ensureOwner('u1');
+  assert.equal(w.engine.editFor('p', '', 'site/notes.md').content, 'mine\n');
+  // Edited again offline: one entry, the first base kept.
+  await w.engine.saveEdit({ projectId: 'p', path: 'site/notes.md', base: 'v-other', content: 'mine, more\n' });
+  assert.equal(w.engine.edits().length, 1);
+  assert.equal(w.engine.edits()[0].base, 'v1');
+  // Back online: one write with expect = base and merge; then gone from both homes, told once.
+  w.server.down = false;
+  w.server.merge = { result: 'merged', path: 'site/notes.md' };
+  await w.engine.sync();
+  assert.equal(w.server.writes.length, 1);
+  const { change } = w.server.writes[0];
+  assert.equal(change.text, 'mine, more\n');
+  assert.equal(change.expect, 'v1');
+  assert.equal(change.merge.device, 'Pixel 8');
+  assert.equal(change.merge.at, 500);
+  assert.equal(w.engine.edits().length, 0);
+  assert.equal(w.plugin.nativeEdits.size, 0);
+  assert.deepEqual(JSON.parse(JSON.stringify(w.told)), [{ result: { result: 'merged', path: 'site/notes.md' }, path: 'site/notes.md' }]);
+  await w.engine.sync();
+  assert.equal(w.told.length, 1);
+});
+
+test('an edit tavya refuses stays until it is saved as a copy or discarded', async () => {
+  const w = world();
+  await w.engine.ensureOwner('u1');
+  w.server.refuse = { status: 403, message: 'Changing main needs permission to land work on it (merge-into:main).' };
+  await w.engine.saveEdit({ projectId: 'p', view: 'branch:dev', path: 'site/a.md', base: 'v1', content: 'a' });
+  await w.engine.saveEdit({ projectId: 'p', path: 'site/b.md', base: 'v1', content: 'b' });
+  await w.engine.sync();
+  assert.equal(w.engine.edits().map((edit) => edit.state).join(), 'refused,refused');
+  assert.match(w.server.writes[0].path, /files\/changes\?branch=dev$/);
+  // Tried again at every sync (a right may be granted meanwhile), never dropped.
+  await w.restart().ensureOwner('u1');
+  await w.engine.sync();
+  assert.equal(w.engine.edits().length, 2);
+  assert.equal(w.engine.edits()[0].state, 'refused');
+  // Save a copy: a new file where one may write.
+  w.server.refuse = null;
+  w.server.writes.length = 0;
+  await w.engine.saveEditCopy('p|branch:dev|site/a.md', 'mine/a.md');
+  assert.deepEqual(JSON.parse(JSON.stringify(w.server.writes[0].change)), { op: 'write', path: 'mine/a.md', text: 'a', expect: null });
+  await w.engine.discardEdit('p||site/b.md');
+  assert.equal(w.engine.edits().length, 0);
+  assert.equal(w.plugin.nativeEdits.size, 0);
+});
+
+test('edits are their owner’s: kept through sign-out and another account, uploaded only as them', async () => {
+  const w = world();
+  await w.engine.ensureOwner('u1');
+  w.server.down = true;
+  await w.engine.saveEdit({ projectId: 'p', path: 'site/a.md', base: 'v1', content: 'a' });
+  await w.engine.wipe();
+  assert.equal(w.engine.edits().length, 0);
+  w.server.down = false;
+  await w.engine.ensureOwner('u2');
+  await w.engine.sync();
+  assert.equal(w.server.writes.length, 0);
+  assert.equal(w.engine.edits().length, 0);
+  await w.engine.ensureOwner('u1');
+  assert.equal(w.engine.edits().length, 1);
+  await w.engine.sync();
+  assert.equal(w.server.writes.length, 1);
+  assert.equal(w.engine.edits().length, 0);
+});
+
+test('an edit saved again while the last one uploads is kept for the next upload', async () => {
+  const w = world();
+  await w.engine.ensureOwner('u1');
+  w.server.down = true;
+  await w.engine.saveEdit({ projectId: 'p', path: 'site/a.md', base: 'v1', content: 'first' });
+  w.server.down = false;
+  w.server.during = () => w.engine.saveEdit({ projectId: 'p', path: 'site/a.md', base: 'v1', content: 'second' });
+  await w.engine.sync();
+  assert.equal(w.engine.edits().length, 1);
+  assert.equal(w.engine.edits()[0].content, 'second');
+  await w.engine.sync();
+  assert.equal(w.server.writes.at(-1).change.text, 'second');
+  assert.equal(w.engine.edits().length, 0);
 });

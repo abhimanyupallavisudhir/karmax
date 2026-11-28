@@ -21,6 +21,21 @@
 //   url({hash}) → {url | null}: a URL the page can load the bytes from
 //   read({hash, offset, length}) → {data: base64, eof}: ≤ 1 MiB, where there is no URL
 //   open({hash, name}) → hands the file to the OS ("Open in…")
+//
+// Offline edits (§ Offline edits): a text file saved while tavya can't be
+// reached goes into an outbox, one entry per file {id, owner, projectId,
+// view, path, base (the version it started from), content, device, at},
+// kept in IndexedDB (`edits`) and, so a wipe of the WebView's storage can't
+// lose it, in the plugin's own store:
+//   saveEdit({id, entry: JSON}) · edits() → {edits: [JSON]} · dropEdit({id})
+//   openEdit({id, name}) → hands the edit to the OS (phones: "Open in…")
+// Every sync first uploads the outbox: one files/changes write with `expect`
+// = base and `merge`, which the server saves, merges line by line, or keeps
+// beside the file under a name saying whose and when. An entry leaves only by
+// an upload or an explicit Discard: offline, refused (no write right) or
+// failing, it stays and is tried again at the next sync. Signing out or
+// another account leaves the outbox alone: it is its owner's, uploaded when
+// they sign in again, and nobody else sees it.
 (() => {
   const MiB = 1024 * 1024, GiB = 1024 * MiB;
   const CHECK_BATCH = 2_000;
@@ -34,11 +49,12 @@
   function idbStore(name = 'tavya-offline') {
     let opened = null;
     const open = () => opened ||= new Promise((resolve, reject) => {
-      const request = indexedDB.open(name, 1);
+      const request = indexedDB.open(name, 2);
       request.onupgradeneeded = () => {
         const db = request.result;
         if (!db.objectStoreNames.contains('pins')) db.createObjectStore('pins', { keyPath: 'id' });
         if (!db.objectStoreNames.contains('meta')) db.createObjectStore('meta');
+        if (!db.objectStoreNames.contains('edits')) db.createObjectStore('edits', { keyPath: 'id' });
       };
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => { opened = null; reject(request.error); };
@@ -61,15 +77,22 @@
       deletePin: (id) => run('pins', 'readwrite', (store) => store.delete(id)),
       getMeta: (key) => run('meta', 'readonly', (store) => store.get(key)),
       putMeta: (key, value) => run('meta', 'readwrite', (store) => store.put(value, key)),
+      // The outbox is not cleared with the pins: only an upload or a Discard removes an edit.
       clear: async () => { await run('pins', 'readwrite', (store) => store.clear()); await run('meta', 'readwrite', (store) => store.clear()); },
+      allEdits: () => run('edits', 'readonly', (store) => store.getAll()),
+      putEdit: (edit) => run('edits', 'readwrite', (store) => { store.put(edit); }),
+      deleteEdit: (id) => run('edits', 'readwrite', (store) => store.delete(id)),
     };
   }
 
   /** The same, in memory (tests). */
   function memoryStore() {
-    const pins = new Map(), meta = new Map();
+    const pins = new Map(), meta = new Map(), edits = new Map();
     const copy = (value) => value === undefined ? undefined : JSON.parse(JSON.stringify(value));
     return {
+      allEdits: async () => [...edits.values()].map(copy),
+      putEdit: async (edit) => { edits.set(edit.id, copy(edit)); },
+      deleteEdit: async (id) => { edits.delete(id); },
       allPins: async () => [...pins.values()].map(copy),
       putPins: async (list) => { for (const pin of list) pins.set(pin.id, copy(pin)); },
       deletePin: async (id) => { pins.delete(id); },
@@ -101,7 +124,7 @@
    * Error with `status` (the console's api()). `origin`: the console's own,
    * for the URLs the plugin downloads.
    */
-  function create({ plugin, request, origin, store = idbStore(), now = () => Date.now(), kind = 'phone' } = {}) {
+  function create({ plugin, request, origin, store = idbStore(), now = () => Date.now(), kind = 'phone', device = () => '', told = () => {} } = {}) {
     let pins = null;
     let loading = null;
     let running = null, again = false;
@@ -110,12 +133,35 @@
     const state = { checkedAt: 0, error: null, offline: false };
     const emit = () => { for (const listener of listeners) { try { listener(); } catch { /* a listener's own problem */ } } };
 
+    let edits = [];
+    let owner = null;
     const load = () => pins ? Promise.resolve(pins) : (loading ||= (async () => {
-      const [list, checkedAt] = await Promise.all([store.allPins(), store.getMeta('checkedAt')]);
+      const [list, checkedAt, known] = await Promise.all([store.allPins(), store.getMeta('checkedAt'), store.getMeta('owner')]);
+      owner ||= known || null;
+      edits = await loadEdits();
       pins = (list || []).map((pin) => ({ ...pin, state: pin.state === 'updating' ? 'stale' : pin.state }));
       state.checkedAt = checkedAt || 0;
       return pins;
     })().finally(() => { loading = null; }));
+    // The outbox from both of its homes: what one lost (a cleared WebView), the other gives back.
+    async function loadEdits() {
+      let local = [];
+      try { local = (await store.allEdits?.()) || []; } catch { /* IndexedDB unusable: the plugin's copy still counts */ }
+      const native = typeof plugin?.edits === 'function' ? await plugin.edits().then((answer) => (answer?.edits || []).map((json) => {
+        try { return typeof json === 'string' ? JSON.parse(json) : json; } catch { return null; }
+      }).filter((edit) => edit?.id), () => null) : null;
+      const byId = new Map();
+      for (const edit of local || []) byId.set(edit.id, edit);
+      for (const edit of native || []) {
+        const have = byId.get(edit.id);
+        if (!have || (edit.rev || 0) > (have.rev || 0)) { byId.set(edit.id, edit); await store.putEdit?.(edit).catch?.(() => {}); }
+      }
+      if (native) {
+        const there = new Set(native.map((edit) => edit.id));
+        for (const edit of byId.values()) if (!there.has(edit.id)) await plugin.saveEdit({ id: edit.id, entry: JSON.stringify(edit) }).catch(() => {});
+      }
+      return [...byId.values()].map((edit) => ({ ...edit, state: edit.state === 'uploading' ? 'queued' : edit.state || 'queued' }));
+    }
     const save = (list) => store.putPins(list.map((pin) => ({ ...pin })));
 
     const limit = async () => (await store.getMeta('limit')) || DEFAULT_LIMIT[kind] || DEFAULT_LIMIT.phone;
@@ -205,6 +251,8 @@
 
     async function syncOnce() {
       await load();
+      // What was edited offline reaches tavya first: the check then sees the result.
+      await uploadEdits();
       // Copies the device no longer has (cleared by the OS) are fetched again.
       const listed = await plugin.list().catch(() => null);
       if (listed) {
@@ -349,6 +397,80 @@
       if (unused.length) await plugin.remove({ hashes: unused });
     }
 
+    // ── the outbox: edits made offline ──────────────────────────────────────
+    const mine = (edit) => (edit.owner || null) === owner;
+    /** Both homes, the plugin's first; throws only when neither kept it. */
+    async function keepEdit(edit) {
+      const results = await Promise.allSettled([
+        typeof plugin?.saveEdit === 'function' ? plugin.saveEdit({ id: edit.id, entry: JSON.stringify(edit) }) : Promise.reject(new Error('no native store')),
+        store.putEdit ? store.putEdit(edit) : Promise.reject(new Error('no outbox')),
+      ]);
+      if (results.every((result) => result.status === 'rejected')) throw results[1].reason || results[0].reason;
+    }
+    async function dropEdit(id) {
+      edits = edits.filter((edit) => edit.id !== id);
+      await Promise.allSettled([plugin?.dropEdit?.({ id }), store.deleteEdit?.(id)]);
+      emit();
+    }
+    /** Keep an edit of a file on this device until it reaches tavya. `base`:
+     * the version it was opened at (a second edit keeps the first's). */
+    async function saveEdit({ projectId, view = '', path, base, content, data, name, projectName }) {
+      await load();
+      if (typeof base !== 'string' || !base) throw new Error('An offline edit needs the version it started from.');
+      const id = pinId(projectId, view, path);
+      const prior = edits.find((edit) => edit.id === id);
+      const edit = { id, owner, projectId, view: view || '', path: parts(path).join('/'), base: prior?.base || base, content: String(content),
+        device: device() || '', at: now(), rev: (prior?.rev || 0) + 1, state: 'queued', reason: null,
+        name: name || parts(path).pop() || '', projectName: projectName || prior?.projectName || '', ...(data || prior?.data ? { data: true } : {}) };
+      await keepEdit(edit);
+      edits = edits.filter((other) => other.id !== id).concat(edit);
+      emit();
+      return edit;
+    }
+    function changesPath(edit) {
+      const branch = branchOf(edit.view);
+      return `/api/projects/${encodeURIComponent(edit.projectId)}/files/changes${branch ? `?branch=${encodeURIComponent(branch)}` : ''}`;
+    }
+    let uploading = null;
+    /** Each of this person's edits, one write each: saved, merged or kept beside (the server decides). */
+    function uploadEdits() {
+      return uploading ||= (async () => {
+        for (const edit of edits.filter(mine)) {
+          if (!edits.includes(edit)) continue;
+          const at = new Date(edit.at), rev = edit.rev;
+          let answer;
+          try {
+            answer = await request(changesPath(edit), { method: 'POST', body: JSON.stringify({ changes: [{ op: 'write', path: edit.path, text: edit.content,
+              expect: edit.base, merge: { ...(edit.device ? { device: edit.device } : {}), at: edit.at, tz: -at.getTimezoneOffset() } }] }) });
+          } catch (error) {
+            if (unreachable(error)) { state.offline = true; edit.state = 'queued'; edit.reason = null; break; }
+            // No right to write here (or the place is gone): it stays, with what can still be done.
+            edit.state = error?.status === 403 || error?.status === 404 ? 'refused' : 'failed';
+            edit.reason = String(error?.message || '') || null;
+            if (edits.includes(edit)) await keepEdit(edit).catch(() => {});
+            emit();
+            continue;
+          }
+          // Saved again while it uploaded: the newer edit stays (merged next time with what this one became).
+          if (edits.find((other) => other.id === edit.id)?.rev === rev) await dropEdit(edit.id);
+          try { told(answer?.merge || { result: 'saved', path: edit.path }, edit); } catch { /* the page's own problem */ }
+        }
+      })().finally(() => { uploading = null; });
+    }
+    /** Write the edit as a new file at `path` (where you can write), instead of over the original. */
+    async function saveEditCopy(id, path) {
+      const edit = edits.find((other) => other.id === id);
+      if (!edit) return null;
+      const copy = { ...edit, path: parts(path).join('/') };
+      const answer = await request(changesPath(copy), { method: 'POST', body: JSON.stringify({ changes: [{ op: 'write', path: copy.path, text: edit.content, expect: null }] }) });
+      if (edits.find((other) => other.id === id)?.rev === edit.rev) await dropEdit(id);
+      return answer;
+    }
+    /** The edit of `path` waiting on this device, if any. */
+    function editFor(projectId, view, path) {
+      return edits.find((edit) => mine(edit) && edit.id === pinId(projectId, view, path)) || null;
+    }
+
     // ── reading ─────────────────────────────────────────────────────────────
     /** The pin holding `path` of a project's view: the place itself or a pinned folder above it. */
     function covering(projectId, view, path) {
@@ -412,6 +534,8 @@
     /** Forget every pin and its bytes (signing out, another account). */
     async function wipe() {
       pins = [];
+      // Edits stay (theirs alone): an expired session must never cost an edit.
+      owner = null;
       updating.clear();
       state.checkedAt = 0;
       await Promise.all([store.clear(), plugin?.wipe?.().catch(() => {})]);
@@ -420,9 +544,14 @@
     /** The copies are one person's: another account signing in starts empty. */
     async function ensureOwner(userId) {
       if (!userId) return;
-      const owner = await store.getMeta('owner');
-      if (owner && owner !== userId) await wipe();
-      if (owner !== userId) await store.putMeta('owner', userId);
+      const known = await store.getMeta('owner');
+      if (known && known !== userId) await wipe();
+      if (known !== userId) await store.putMeta('owner', userId);
+      owner = userId;
+      // Edits made before anyone was known (a first offline start) are this person's.
+      await load();
+      for (const edit of edits) if (!edit.owner) { edit.owner = userId; await keepEdit(edit).catch(() => {}); }
+      emit();
     }
 
     async function usage() {
@@ -432,6 +561,8 @@
 
     return {
       available: !!plugin, load, prepare, pin, unpin, sync, wipe, ensureOwner, usage, covering, node, bytes,
+      saveEdit, editFor, saveEditCopy, discardEdit: dropEdit, edits: () => edits.filter(mine),
+      openEdit: (id, name) => plugin.openEdit({ id, name }), canOpenEdit: () => typeof plugin?.openEdit === 'function',
       setLimit: async (bytes) => { await store.putMeta('limit', bytes); emit(); again = true; return sync(); },
       pins: () => pins || [],
       get: (id) => (pins || []).find((pin) => pin.id === id) || null,
