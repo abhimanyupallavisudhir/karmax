@@ -39,7 +39,7 @@ test('RQ-16: the socket says which project and task this tab shows, once per cha
   function WebSocket() { this.readyState = 1; this.send = (data) => sent.push(JSON.parse(data)); }
   WebSocket.OPEN = 1;
   const ctx = vm.createContext({ noteRowAskEvent: () => {}, rowAskEpoch: 0, S: { projectId: 'p', selected: null }, location: { protocol: 'http:', host: 'test' }, WebSocket, document: { hidden: false },
-    setWsOnline: () => {}, checkConsoleRevision: () => {}, wsHadDropped: false });
+    setWsOnline: () => {}, checkConsoleRevision: () => {}, announceDesktopPush: () => {}, wsHadDropped: false });
   vm.runInContext(`${fn('connectWs')}\n${fn('syncLiveWatch')}\n${fn('isCrossProjectList')}`, ctx); ctx.connectWs();
   ctx.S.ws.onopen();
   ctx.S.selected = 't'; ctx.syncLiveWatch(); ctx.syncLiveWatch();

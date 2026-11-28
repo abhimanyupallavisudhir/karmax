@@ -148,3 +148,137 @@ describe('the phone\'s session in Profile → Apps and tokens', () => {
     expect((await me(f.cookie)).status).toBe(200);
   });
 });
+
+/**
+ * The desktop apps (wiki features/desktop-apps) sign in the same way through
+ * the first-party client `tavya-desktop`, returning to a one-shot loopback
+ * listener (RFC 8252 §7.3): any port on 127.0.0.1 or [::1], path `/signed-in`.
+ */
+const DESKTOP = 'tavya-desktop';
+async function signInDesktop(redirect = 'http://127.0.0.1:53682/signed-in', limit: Record<string, unknown> = {}) {
+  const { verifier, challenge } = pkce();
+  const authorize = await fetch(`${f.g.url}/oauth/authorize?${new URLSearchParams({ response_type: 'code', client_id: DESKTOP,
+    redirect_uri: redirect, code_challenge: challenge, code_challenge_method: 'S256', state: 'dk' })}`, { redirect: 'manual' });
+  if (authorize.status !== 302) return { status: authorize.status, verifier };
+  const id = new URL(authorize.headers.get('location')!, f.g.url).searchParams.get('request')!;
+  const view = await f.call('GET', `/api/oauth/authorizations/${id}`);
+  const approved = await f.call('POST', `/api/oauth/authorizations/${id}/approve`, { cookie: f.cookie }, limit);
+  return { status: 302, verifier, view: view.body, approved, back: approved.status === 200 ? new URL(approved.body.redirectUri) : undefined };
+}
+
+describe('signing the desktop app in', () => {
+  it('returns to any loopback port at /signed-in and lists the session as the desktop', async () => {
+    for (const redirect of ['http://127.0.0.1:53682/signed-in', 'http://[::1]:40001/signed-in']) {
+      const { verifier, view, back } = await signInDesktop(redirect);
+      expect(view.client).toMatchObject({ id: DESKTOP, kind: 'first-party', verified: true });
+      expect(`${back!.origin}${back!.pathname}`).toBe(redirect);
+      expect(back!.searchParams.get('state')).toBe('dk');
+      const signedIn = await exchange({ client_id: DESKTOP, code: back!.searchParams.get('code')!, code_verifier: verifier,
+        redirect_uri: redirect, name: 'tavya on Mac' });
+      expect(signedIn.status).toBe(200);
+      expect((await me(signedIn.cookie!)).status).toBe(200);
+      const listed = (await grants(signedIn.cookie!)).find((grant) => grant.current);
+      expect(listed).toMatchObject({ kind: 'app', clientId: DESKTOP, name: 'tavya on Mac' });
+    }
+  });
+
+  it('refuses another path, a non-loopback host, and a code redeemed at another port', async () => {
+    for (const redirect of ['http://127.0.0.1:53682/callback', 'http://example.com:53682/signed-in', 'http://localhost:53682/signed-in', 'io.tavya.app://signed-in'])
+      expect((await signInDesktop(redirect)).status, redirect).toBe(400);
+    const { verifier, back } = await signInDesktop('http://127.0.0.1:53682/signed-in');
+    expect(await exchange({ client_id: DESKTOP, code: back!.searchParams.get('code')!, code_verifier: verifier,
+      redirect_uri: 'http://127.0.0.1:53683/signed-in' })).toMatchObject({ status: 400, body: { error: 'invalid_grant' } });
+  });
+
+  it('keeps each app\'s code to its own client, and refuses a limit', async () => {
+    const { verifier, back } = await signInDesktop();
+    expect(await exchange({ client_id: APP, code: back!.searchParams.get('code')!, code_verifier: verifier,
+      redirect_uri: 'http://127.0.0.1:53682/signed-in' })).toMatchObject({ status: 400 });
+    const token = await f.form('/oauth/token', { grant_type: 'authorization_code', client_id: DESKTOP, code: back!.searchParams.get('code')!,
+      redirect_uri: 'http://127.0.0.1:53682/signed-in', code_verifier: verifier });
+    expect(token.body.error).toBe('unauthorized_client');
+    const limited = await signInDesktop(undefined, { level: 'viewer' });
+    expect(limited.approved!.status).toBe(400);
+  });
+});
+
+/**
+ * The device token (wiki planned/native-apps-round-2 § contracts): native code
+ * of the apps (Siri, a share extension, a widget, the tray) acts without the
+ * WebView through a refresh token of the same `app` grant. It lives exactly as
+ * long as the console session it came with, and using it never extends that.
+ */
+describe('the apps\' device token', () => {
+  async function signedInWithToken() {
+    const { verifier, redirect } = await signInInBrowser();
+    const result = await exchange({ code: redirect!.searchParams.get('code')!, code_verifier: verifier, redirect_uri: REDIRECT,
+      name: 'Phone with token', device_token: true } as any);
+    expect(result.status).toBe(200);
+    return { cookie: result.cookie!, token: result.body.deviceToken as string, grantId: result.body.grantId as string };
+  }
+  const refresh = (token: string, client = APP) => f.form('/oauth/token', { grant_type: 'refresh_token', client_id: client, refresh_token: token });
+
+  it('is given only when asked for, and trades for access tokens acting as the person', async () => {
+    const { verifier, redirect } = await signInInBrowser();
+    const plain = await exchange({ code: redirect!.searchParams.get('code')!, code_verifier: verifier, redirect_uri: REDIRECT });
+    expect(plain.status).toBe(200);
+    expect(plain.body.deviceToken).toBeUndefined();
+
+    const { token, grantId } = await signedInWithToken();
+    expect(token).toMatch(new RegExp(`^tvr_${grantId}\\.`));
+    const first = await refresh(token);
+    expect(first.status).toBe(200);
+    expect(first.body.access_token).toMatch(/^tva_/);
+    expect(first.body.refresh_token).toMatch(/^tvr_/);
+    expect(first.body.scope).toBe('all');
+    const who = await f.call('GET', '/api/user/me', { bearer: first.body.access_token });
+    expect(who.body).toMatchObject({ id: f.user.id, via: { kind: 'app', grantId } });
+    // The person's authority: their projects are readable.
+    expect((await f.call('GET', `/api/projects/${f.site.id}`, { bearer: first.body.access_token })).status).toBe(200);
+    // Another client cannot use it.
+    expect((await refresh(first.body.refresh_token, DESKTOP)).body.error).toBe('invalid_grant');
+  });
+
+  it('rotates, and a rotated token presented again signs the app out', async () => {
+    const { cookie, token } = await signedInWithToken();
+    const next = await refresh(token);
+    expect(next.status).toBe(200);
+    expect((await refresh(token)).body.error).toBe('invalid_grant');
+    expect((await me(cookie)).status).toBe(401);
+    expect((await f.call('GET', '/api/user/me', { bearer: next.body.access_token })).status).toBe(401);
+    expect((await refresh(next.body.refresh_token)).body.error).toBe('invalid_grant');
+  });
+
+  it('dies when the app signs out or the grant is revoked', async () => {
+    const out = await signedInWithToken();
+    const access = (await refresh(out.token)).body;
+    await fetch(`${f.g.url}/api/auth/sign-out`, { method: 'POST', headers: { origin: f.g.url, cookie: out.cookie, 'content-type': 'application/json' }, body: '{}' });
+    expect((await f.call('GET', '/api/user/me', { bearer: access.access_token })).status).toBe(401);
+    expect((await refresh(access.refresh_token)).body.error).toBe('invalid_grant');
+
+    const revoked = await signedInWithToken();
+    expect((await f.call('DELETE', `/api/user/app-grants/${revoked.grantId}`, { cookie: f.cookie })).status).toBe(200);
+    expect((await refresh(revoked.token)).body.error).toBe('invalid_grant');
+  });
+
+  it('dies with the session\'s expiry, and using it does not extend the session', async () => {
+    const { cookie, token, grantId } = await signedInWithToken();
+    const before = (await grants()).find((grant) => grant.id === grantId);
+    // Thirteen days on, the token still works and the session's expiry has not moved.
+    const start = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(start + 13 * 24 * 3600_000);
+    const used = await refresh(token);
+    expect(used.status).toBe(200);
+    expect((await f.call('GET', '/api/user/me', { bearer: used.body.access_token })).status).toBe(200);
+    expect(used.body.expires_in).toBeLessThanOrEqual(3600);
+    const after = (await f.call('GET', '/api/user/app-grants', { bearer: used.body.access_token })).body.grants.find((grant: any) => grant.id === grantId);
+    expect(after.expiresAt).toBe(before.expiresAt);
+    // Past the session's expiry, nothing works.
+    vi.spyOn(Date, 'now').mockReturnValue(before.expiresAt + 1000);
+    expect((await refresh(used.body.refresh_token)).body.error).toBe('invalid_grant');
+    expect((await f.call('GET', '/api/user/me', { bearer: used.body.access_token })).status).toBe(401);
+    // (The cookie itself is Better Auth's to expire, by its own clock.)
+    void cookie;
+    expect((await grants()).some((grant) => grant.id === grantId)).toBe(false);
+  });
+});
