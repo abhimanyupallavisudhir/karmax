@@ -3349,6 +3349,13 @@ html[data-theme="dark"] .github-signin-btn:active,
 }
 @keyframes mic-breathe { from { transform: scale(1); opacity: .55; } to { transform: scale(1.7); opacity: 0; } }
 @media (prefers-reduced-motion: reduce) { .mic-button.listening::after { animation: none; opacity: .35; transform: scale(1.25); } }
+/* A phrase on its way to the server's recognizer (Electron, Firefox): its words follow. */
+.mic-button.transcribing::before {
+  content: '…'; position: absolute; right: 100%; margin-right: 2px; color: var(--ink-3); font-size: 15px; line-height: 1;
+  animation: mic-wait 1.2s ease-in-out infinite; pointer-events: none;
+}
+@keyframes mic-wait { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .mic-button.transcribing::before { animation: none; } }
 @media (pointer: coarse) { .mic-button { width: 40px; height: 40px; } }
 .setting-label.nowrap { width: auto; white-space: nowrap; }
 #push-devices:empty { border: 0; }

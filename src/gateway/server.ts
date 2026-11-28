@@ -357,6 +357,10 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   // OpenRouter connection: the capability of using a connected app.
   if (/^\/api\/organizations\/[^/]+\/generations(?:\/|$)/.test(p)) return 'connection:use';
   if (p === '/api/generation-models' && read) return 'none';
+  // Dictation (wiki features/push-and-voice § Server-side dictation): anyone of
+  // the organization, since it only turns their own voice into their own words;
+  // its few cents a minute are on the organization's credit, rate-limited per person.
+  if (p === '/api/speech/transcriptions') return 'organization:read';
   if (/^\/api\/projects\/[^/]+\/wiki(?:\/|$)/.test(p)) return read ? 'project:read' : 'skill:write';
   if (/^\/api\/projects\/[^/]+\/avatar-settings$/.test(p)) return read ? 'project:read' : 'project:settings:write';
   if (/^\/api\/projects\/[^/]+\/avatars(?:\/[^/]+)?$/.test(p)) return read ? 'project:read' : 'task:create';
@@ -2562,6 +2566,10 @@ export class Gateway {
         modelBenchmarks: this.artificialAnalysis.available,
         // The phone apps register for native push only once the installation's Firebase key is set (wiki features/phone-apps).
         nativePush: (await this.deps.nativePush?.available()) ?? false,
+        // Dictation where the browser has no recognizer of its own (Electron,
+        // Firefox) needs an OpenRouter key to pay for it (wiki features/push-and-voice).
+        serverDictation: Boolean(process.env.OPENROUTER_API_KEY)
+          || Boolean(this.deps.broker && await includedModel(this.deps.store, this.deps.broker).catch(() => undefined)),
         // Whether an error shown in the console can be reported (wiki features/error-reports).
         errorReports: Boolean(await errorReporter()?.destination().catch(() => undefined)),
       });
@@ -9036,6 +9044,36 @@ export class Gateway {
           return this.json(res, 400, { error: `kind must be one of ${generation.GENERATION_KINDS.join(', ')}` });
         return this.json(res, 200, { kind, models: await generation.generationModels(kind as typeof generation.GENERATION_KINDS[number]) });
       }
+      // A phrase of dictation → its words (src/agent/transcription.ts): the
+      // audio is the body, read into memory, sent on and dropped; never stored.
+      if (p === '/api/speech/transcriptions') {
+        if (method !== 'POST') return this.json(res, 405, { error: 'POST the audio of one phrase (≤ 30 s) as the body, Content-Type audio/webm, audio/ogg or audio/wav' });
+        const organizationId = requestedScope.organizationId ?? authRecord.organizationId;
+        if (!organizationId) return this.json(res, 400, { error: 'organizationId is required: the organization whose credit pays' });
+        const transcription = await import('../agent/transcription.js');
+        if (!(this.transcriptionAdmission ??= new transcription.TranscriptionAdmission()).admit(actorPrincipal(callerIdentity.actor)))
+          return this.json(res, 429, { error: 'Too much dictation at once; try again in a minute.' });
+        const { GenerationRequestError, GenerationUnavailable } = await import('../agent/generation.js');
+        const { ComputeCreditExhausted } = await import('../world/managed-compute.js');
+        let audio: Buffer;
+        try { audio = await this.rawBody(req, transcription.TRANSCRIPTION_MAX_BYTES); }
+        catch (error) {
+          if (error instanceof AttachmentError) return this.json(res, 413, { error: `send at most ${transcription.TRANSCRIPTION_MAX_SECONDS} s of audio a request (a phrase at a time)` });
+          throw error;
+        }
+        try {
+          const result = await transcription.transcribe({ store, broker: this.deps.broker, configHomes: this.deps.configHomes }, organizationId,
+            { audio, contentType: String(req.headers['content-type'] ?? ''), ...(url.searchParams.get('language') ? { language: url.searchParams.get('language')! } : {}) });
+          return this.json(res, 200, { text: result.text, ...(result.costUsd !== undefined ? { costUsd: result.costUsd } : {}),
+            ...(result.seconds !== undefined ? { seconds: result.seconds } : {}) });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          if (error instanceof ComputeCreditExhausted) return this.json(res, 402, { error: message });
+          if (error instanceof GenerationUnavailable) return this.json(res, 409, { error: message });
+          if (error instanceof GenerationRequestError) return this.json(res, error.status, { error: message });
+          throw error;
+        }
+      }
       const orgGeneration = p.match(/^\/api\/organizations\/([^/]+)\/generations(?:\/([^/]+)(\/content)?)?$/);
       if (orgGeneration) {
         const organizationId = decodeURIComponent(orgGeneration[1]!);
@@ -12325,6 +12363,8 @@ export class Gateway {
   private badRequest(res: http.ServerResponse, e: unknown) {
     return this.json(res, errorStatus(e, 400), { error: e instanceof Error ? e.message : String(e) });
   }
+  /** Phrases of dictation a person may send (src/agent/transcription.ts). */
+  private transcriptionAdmission?: import('../agent/transcription.js').TranscriptionAdmission;
   /** Reports a person may file: 20 an hour each. Each is one write to a counted event. */
   private errorReportAdmission = (() => {
     const recent = new Map<string, number[]>();
