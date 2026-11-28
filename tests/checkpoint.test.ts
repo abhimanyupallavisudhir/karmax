@@ -934,6 +934,29 @@ describe('files outside every checkout', () => {
     } finally { await cleanup(); }
   });
 
+  it('never stores tavya\'s own files in a world with no repository (browser profile, agent home, ballast)', async () => {
+    const { store, worlds, service, cleanup } = await setup('checkpoint-platform-');
+    try {
+      const project = await store.createProject('Repo-less', { worldProvider: 'worktree' });
+      const task = await store.createTask({ projectId: project.id, title: 'CEO', workflow: 'software-dev',
+        workflowVersion: '1.30.0', params: { prompt: 'run the firm' } });
+      const world = await worlds.create('worktree', { taskId: task.id, base: 'main' });
+      world.handle.meta = { projectId: project.id };
+      world.handle = await store.registerWorld(world.handle, project.id) as typeof world.handle;
+      await world.writeFile('.karmax-injection/agent/browser-profile/Default/Cookies', 'cookies');
+      await world.writeFile('.karmax-injection/agent/claude/projects/memory/MEMORY.md', '# memory');
+      await world.writeFile('.karmax-injection/ballast', 'ballast');
+      await world.writeFile('plans/q1.md', '# Q1\n');
+      const checkpoint = await service.checkpoint(world.handle);
+      expect(checkpoint.filesystemDelta).toMatchObject({ files: 1 });
+      const organizationId = (await store.getProject(project.id))!.organizationId!;
+      const kept: string[] = [];
+      for await (const entry of (service as any).chunks.entries(checkpoint, organizationId)) kept.push(`${entry.repo}:${entry.path}`);
+      expect(kept).toEqual([':plans/q1.md']);
+      await world.destroy();
+    } finally { await cleanup(); }
+  });
+
   it('keeps every file it kept before when a repository is attached mid-task (andhbhakt #1: renders beside the checkout)', async () => {
     const { dir, makeRepo, store, worlds, service, cleanup } = await setup('checkpoint-no-shrink-');
     try {

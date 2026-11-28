@@ -5,6 +5,7 @@ import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
 import { forkSourceRole } from '../domain/forks.js';
+import { gitDerivedReviewSummary, isGitDerivedReviewSummary, withoutPlatformPaths, workspaceReviewSummary, type ChangedFilesReview } from '../domain/changed-files.js';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { buildVersionedBundle } from '../packages/bundle.js';
@@ -469,15 +470,6 @@ function upstreamPrBody(details: OpenPrDetails, title: string, commits: string[]
   return summary.length > 60_000 ? `${summary.slice(0, 60_000)}\n… (summary truncated)` : summary;
 }
 
-/** The review summary buildReview writes when the agent wrote none. */
-export function gitDerivedReviewSummary(changed: number, shown?: number): string {
-  if (!changed) return 'No file changes detected.';
-  return `${changed} file(s) changed.${shown != null ? ` Showing ${shown}; inspect the checkouts for the full list.` : ''}`;
-}
-
-export function isGitDerivedReviewSummary(summary: string): boolean {
-  return /^(?:\d+ file\(s\) changed\.(?: Showing \d+; inspect the checkouts for the full list\.)?|No file changes detected\.)$/.test(summary.trim());
-}
 
 function upstreamRef(repo: string, slug: string, headRepository: string, pr: GithubPullRequest): TaskPullRequest {
   return {
@@ -4750,15 +4742,20 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
      *  `landed`: per checkout, the head its latest pull request landed at (several
      *  branches): work up to it is no longer the task's to show, however it landed
      *  (a squash leaves no ancestry) and whether or not this world fetched it. */
-    async buildReview(handle: WorldHandle, base: string, landed?: Record<string, string>): Promise<{ summary: string; changedFiles: string[] }> {
+    async buildReview(handle: WorldHandle, base: string, landed?: Record<string, string>): Promise<ChangedFilesReview> {
       const world = await openWorld(handle);
       const repos = worldRepos(handle);
+      // One computation for every view: the list, its count and the summary.
+      // tavya's own files (.karmax-injection) are never the task's work.
+      const reviewed = (files: string[], summarize: (count: number, shown?: number) => string): ChangedFilesReview => {
+        const own = withoutPlatformPaths(files);
+        const { changedFiles, truncated } = reviewFiles(own);
+        return { summary: summarize(own.length, truncated ? changedFiles.length : undefined), changedFiles, changedFileCount: own.length };
+      };
       if (!repos.length) {
-        const files = (await world.listFiles()).map((file) => `${file} (new)`);
-        const { changedFiles, truncated } = reviewFiles(files);
-        const summary = files.length ? `${files.length} file(s) in the task workspace.${truncated ? ` Showing ${changedFiles.length}; inspect the workspace for the full list.` : ''}` : 'No file changes detected.';
-        (await record(handle.id, 'review.built', { files: changedFiles.length }));
-        return { summary, changedFiles };
+        const review = reviewed((await world.listFiles()).map((file) => `${file} (new)`), workspaceReviewSummary);
+        (await record(handle.id, 'review.built', { files: review.changedFileCount }));
+        return review;
       }
       const roots = repos;
       const developmentRepos = repos.filter((repo) => repo.role !== 'project-wiki');
@@ -4798,10 +4795,9 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           ...untracked.stdout.split('\0').filter(Boolean).map((file) => `${prefix}${file} (new)`),
         );
       }
-      const bounded = reviewFiles(changedFiles);
-      const summary = gitDerivedReviewSummary(changedFiles.length, bounded.truncated ? bounded.changedFiles.length : undefined);
-      (await record(handle.id, 'review.built', { files: changedFiles.length }));
-      return { summary, changedFiles: bounded.changedFiles };
+      const review = reviewed(changedFiles, gitDerivedReviewSummary);
+      (await record(handle.id, 'review.built', { files: review.changedFileCount }));
+      return review;
     },
 
     /** Readiness check for the explicit Open PR transition. The Do agent owns

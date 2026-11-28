@@ -3,6 +3,7 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { NO_COMPUTER } from '../domain/computer.js';
 import { taskBranch } from '../domain/brand.js';
+import { PLATFORM_DIR } from '../domain/changed-files.js';
 import { readRegularFilePrefix, regularFileSize } from './file-prefix.js';
 import { World, WorldHandle, WorldProvider, WorldSpec, ExecResult, WorldProcess, WorldPty, worldRelativePath } from './types.js';
 
@@ -117,7 +118,7 @@ class NoneWorld implements World {
     const walk = (dir: string, prefix: string) => {
       for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
         const rel = prefix ? `${prefix}/${entry.name}` : entry.name;
-        if (entry.isDirectory()) walk(path.join(dir, entry.name), rel);
+        if (entry.isDirectory()) { if (entry.name !== PLATFORM_DIR) walk(path.join(dir, entry.name), rel); }
         else if (entry.isFile()) out.push(rel);
       }
     };

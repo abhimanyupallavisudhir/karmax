@@ -243,10 +243,10 @@ class ContainerWorld implements World {
     args.push(this.name, 'bash', ...(spec.command ? ['-lc', spec.command] : ['--norc', '-i']));
     return openSpawnedPty('docker', args, spec);
   }
-  /** Every non-directory entry outside `.git`; `find` lists a symlinked
-   * directory as an entry and never walks into it. */
+  /** Every non-directory entry outside `.git` and tavya's `.karmax-injection`;
+   * `find` lists a symlinked directory as an entry and never walks into it. */
   async listFiles(): Promise<string[]> {
-    const listed = await this.fileCommand('cd /work && find . -name .git -prune -o ! -type d -print0', []);
+    const listed = await this.fileCommand('cd /work && find . \\( -name .git -o -name .karmax-injection \\) -prune -o ! -type d -print0', []);
     return listed.toString('utf8').split('\0').filter(Boolean).map((file) => file.slice(2));
   }
   /** Another branch of a repo in this sandbox (SPEC §11.1, multi-PR). The repos
