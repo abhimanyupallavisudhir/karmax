@@ -5,6 +5,7 @@ import { taskEnded } from '../world/task-ended.js';
 import { CheckpointRefusedError } from '../world/checkpoint-chunks.js';
 import { conversationFor, participantLabel, workDigest } from '../domain/participants.js';
 import { forkSourceRole } from '../domain/forks.js';
+import { refusedFormsNotice, withRefusedForms } from '../domain/message-forms.js';
 import { gitDerivedReviewSummary, isGitDerivedReviewSummary, withoutPlatformPaths, workspaceReviewSummary, type ChangedFilesReview } from '../domain/changed-files.js';
 import { createHash } from 'node:crypto';
 import { AsyncLocalStorage } from 'node:async_hooks';
@@ -4017,6 +4018,18 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${forkNotice})` } : message);
         forkNotice = undefined;
       }
+      // A form in the agent's last message nobody was shown (its final message
+      // could not be refused as a tool call is): say why, on the newest message
+      // it has not read (wiki features/message-forms).
+      const formNoticeKey = `form-notice:${args.taskId}:${speaker}`;
+      if (!resumedActivityAttempt && messages.length > (deliveredMessages ?? 0)) {
+        const notice = await store.kvGet(formNoticeKey).catch(() => undefined);
+        if (notice) {
+          const last = messages.length - 1;
+          messages = messages.map((message, index) => index === last ? { ...message, text: `${message.text}\n\n(${notice})` } : message);
+          await store.kvDelete(formNoticeKey);
+        }
+      }
       // What the agent should know about its disk rides on the newest message it
       // has not read; with none, on its instructions for this turn.
       let diskPromptNotice = forkNotice ? `\n\n${forkNotice}` : '';
@@ -4074,6 +4087,8 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
       let lastEmit: string | undefined;
       let lastPressureDetail: string | undefined;
       let finalActivity: NonNullable<Message['sourceActivity']> | undefined;
+      /** What was wrong with forms the agent said this turn (told to it at its next). */
+      const refusedForms = new Set<string>();
       // Whatever the agent prints is archived (RT-12): its events, final answer,
       // journal and review info. Scrub every value this task was handed — the
       // turn's own credentials below, and every secret recorded as delivered to
@@ -4398,8 +4413,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
             (await store.checkpointReviewInfo(args.taskId, (await taskSecrets.refresh()).scrubValue(info)));
             (await record(args.taskId, 'review.updated', {}));
           },
-          onActivity: async (activity) => {
+          onActivity: async (said) => {
             const turnId = args.agentTurnId ?? legacyAgentTurnId;
+            // A bad form in what the agent says is shown as refused, with why (wiki features/message-forms).
+            const checked = said.kind === 'message' && said.title ? withRefusedForms(said.title) : undefined;
+            for (const problem of checked?.problems ?? []) refusedForms.add(problem);
+            const activity = checked?.problems.length ? { ...said, title: checked.text } : said;
             if (activity.kind === 'message' && turnId) {
               finalActivity = { turnId, id: activity.id, attempt: activityAttempt };
             }
@@ -4524,6 +4543,12 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
         // sub-task prompts and skills are stored. Read once more what the task
         // received before anything leaves the activity.
         result = (await taskSecrets.refresh()).scrubValue(result);
+        if (result.output) {
+          const checked = withRefusedForms(result.output);
+          for (const problem of checked.problems) refusedForms.add(problem);
+          if (checked.problems.length) result = { ...result, output: checked.text };
+        }
+        if (refusedForms.size) await store.kvSet(`form-notice:${args.taskId}:${speaker}`, refusedFormsNotice([...refusedForms]));
         if (result.output?.trim() && finalActivity) result.finalActivity = finalActivity;
         if (resultKey) {
           await store.kvSet(resultKey, JSON.stringify({ result, admissionId: usageAdmissionId }));

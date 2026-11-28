@@ -225,6 +225,7 @@ export const PLATFORM_API_CATALOG = {
   ],
   conversations: [
     'GET /api/tasks/:taskId/agents', 'GET /api/tasks/:taskId/conversation?role=',
+    'POST /api/message-forms/save {form: the ```form fence\'s JSON as the agent wrote it, values: {field: value}} (a person answering a secure form: the server checks its save against the settings a form may write — /api/meta messageForms — fills {{field}} from the form\'s own fields, and makes it with the caller\'s authority, answering as that route does; 400 with the reason for a form that may not save)',
     'GET /api/tasks/:taskId/fork-history?role= (a forked agent\'s conversation before this task: each readable source task, oldest first, cut where the next forked from it)',
     'GET|POST|DELETE /api/tasks/:taskId/conversation-share?role=',
     'GET|PUT /api/projects/:projectId/conversation-sharing',

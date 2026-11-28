@@ -7,6 +7,7 @@ import { REPOSITORY_ROUTE } from '../world/resource-repository.js';
 import { clientAddress, ClientRequestLimits } from './client-address.js';
 import { parseDay, SiteAnalytics, siteAnalyticsReport } from '../platform/site-analytics.js';
 import { beaconSource, crawlerOf } from '../domain/site-analytics.js';
+import { checkForm, fillFormTemplate, formValues, messageFormPolicy } from '../domain/message-forms.js';
 import { keepAuthorized, socketLifetime } from './socket-lifetime.js';
 import type { PasskeyCredential } from '../autonomy/passkey.js';
 import { ExecutionOutput } from './execution-output.js';
@@ -279,6 +280,8 @@ export function routeCapability(method: string, p: string, url?: URL): KnownCapa
   // Anyone signed in may report an error they saw (wiki features/error-reports);
   // a task's is read from the task, which the handler checks they can see.
   if (p === '/api/error-reports' && !read) return 'none';
+  // The save it relays is checked as its own request (Gateway.asCaller).
+  if (p === '/api/message-forms/save' && !read) return 'none';
   if (p === '/api/user/export' || p === '/api/user/default-organization' || p === '/api/user/preferences' || p === '/api/user/paid-subscriptions' || p === '/api/user/plans'
     || p === '/api/user/onboarding' || p === '/api/user/onboarding/reset' || p === '/api/user/account-deletion-request') return 'none';
   // A signed-in person always owns their own Git identity. It is not an
@@ -2568,6 +2571,9 @@ export class Gateway {
         nativePush: (await this.deps.nativePush?.available()) ?? false,
         // Whether an error shown in the console can be reported (wiki features/error-reports).
         errorReports: Boolean(await errorReporter()?.destination().catch(() => undefined)),
+        // Where an agent's form may save: the console draws forms by this, the
+        // server's own list, so a tab open across a deploy reads the new one (wiki features/message-forms).
+        messageForms: messageFormPolicy(),
       });
     }
     // The serving commit (public: the repository is) lets a deploy, the
@@ -2908,6 +2914,19 @@ export class Gateway {
       if (chatLinkMatch && method === 'DELETE') {
         requireHumanSubject(callerIdentity);
         return this.json(res, 200, await api.deleteChatLink(token, decodeURIComponent(chatLinkMatch[1]!)));
+      }
+      // A person's answer to an agent's secure form (wiki features/message-forms):
+      // the form as the agent wrote it, and what they entered. Its save is made
+      // here — checked against the one list of settings a form may write, and
+      // filled from the form's own fields — then as the caller, through the
+      // gateway's own front door, so it changes only what they could in Settings.
+      if (p === '/api/message-forms/save' && method === 'POST') {
+        const b = await this.body(req);
+        const verdict = checkForm(String(b.form ?? ''));
+        if (!verdict.ok) return this.json(res, 400, { error: `This form may not save: ${verdict.problem}.` });
+        const save = verdict.form.save;
+        if (!save) return this.json(res, 400, { error: 'This form saves nothing.' });
+        return this.asCaller(req, res, save.method, save.path, fillFormTemplate(save.body, formValues(verdict.form, b.values)));
       }
       // Report an error seen in the console (wiki features/error-reports): a
       // task's current error ({taskId}), or one in the caller's words
@@ -12280,6 +12299,23 @@ export class Gateway {
     const checked = await this.deps.tokens.check(token, capability, scope);
     if (checked.ok) return undefined;
     return `${checked.reason ?? `missing capability ${capability}`}${checked.missing ? (await this.capabilityHint(checked.missing, checked.record, scope)) : ''}`;
+  }
+
+  /** Make `method path` as the caller of `req` (its session cookie or bearer),
+   * through this gateway's front door — every check a request of theirs gets —
+   * and answer `res` with what it answered. */
+  private async asCaller(req: http.IncomingMessage, res: http.ServerResponse, method: string, target: string, body: unknown) {
+    if (!this.loopbackUrl) return this.json(res, 503, { error: 'the gateway is not listening yet' });
+    const headers: Record<string, string> = { 'content-type': 'application/json', 'x-karmax-loopback': this.loopbackSecret };
+    for (const name of ['cookie', 'authorization', 'user-agent', 'x-forwarded-proto', 'x-forwarded-for'] as const) {
+      const value = req.headers[name];
+      if (typeof value === 'string') headers[name] = value;
+    }
+    const answer = await fetch(new URL(target, this.loopbackUrl), { method, headers, body: JSON.stringify(body ?? {}), redirect: 'manual' });
+    const text = await answer.text();
+    res.writeHead(answer.status, { 'content-type': answer.headers.get('content-type') ?? 'application/json; charset=utf-8',
+      'x-karmax-cell': this.deps.cellId ?? 'local' });
+    res.end(text);
   }
 
   private json(res: http.ServerResponse, status: number, obj: unknown) {
