@@ -1011,6 +1011,10 @@ export function buildWikiPromptContext(args: {
   /** Live task-world checkout for the project wiki. When absent, use the
    * canonical repository under `contentDir` (human/default-branch reads). */
   projectRoot?: string;
+  /** Where the task world's project-wiki checkout is, as the agent sees it.
+   * Set ⇒ the agent's project-wiki edits are commits on its task branch that
+   * land only through its pull request, so the prompt says so. */
+  projectWikiCheckout?: string;
   /** External override for the built-in instructions (tests/deployments). */
   builtinInstructions?: string;
   /** Task text scanned for `[[proj:…]]`/`[[org:…]]` references. */
@@ -1077,6 +1081,9 @@ export function buildWikiPromptContext(args: {
       `Wiki access (works from any world, including cloud sandboxes): read_wiki(scope, id, path?) — no path lists a full table of contents (expanding any [more…]), a section path lists that section, a skill path returns its full markdown; search_wiki(scope, id, query) greps every wiki page. ` +
         `Scopes here: ${scopes.map((s) => `${s.scope} id "${s.id}"`).join(', ')}. ` +
         `To add or update an entry, platform_request PUT ${scopes.map(apiBase).join('/page or ')}/page with {path, content, kind} (SKILL.md format: YAML frontmatter name/description/labels/importance, then markdown; label an entry \`default\` to inline it into every task). ` +
+        (args.projectId && args.projectWikiCheckout
+          ? `The project wiki is Git-tracked: it is the checkout ${args.projectWikiCheckout} on this task's branch, and an edit to it — a file you change there, or a PUT of a project page, which commits to that branch — reaches the wiki only when your pull request lands. Commit your file edits and finish with open_pr exactly as for code, also when the wiki is the only thing you changed. `
+          : '') +
         `To inline a page/label/folder into a task's context, reference it as \`[[proj:<path>]]\` / \`[[org:<path>]]\` (a whole label is \`[[proj:tag:<label>]]\`, a folder is \`[[proj:<section>/*]]\`); create_task also accepts a \`wikiContext\` array of these references.`,
     );
   }

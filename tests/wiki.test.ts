@@ -551,6 +551,20 @@ describe('buildWikiPromptContext', () => {
     } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
   });
 
+  it('tells a task with a project-wiki checkout that its wiki edits land only through its pull request', () => {
+    const contentDir = tmp();
+    try {
+      writeWikiPage(wikiRoot(contentDir, 'project', 'p1'), 'proj-skill', '---\ndescription: proj one\n---\nx');
+      const withCheckout = buildWikiPromptContext({ contentDir, projectId: 'p1', projectWikiCheckout: '/home/user/w/wiki' });
+      expect(withCheckout).toContain('/home/user/w/wiki');
+      expect(withCheckout).toMatch(/project wiki is Git-tracked/);
+      expect(withCheckout).toMatch(/open_pr/);
+      // Without a checkout (a person's canonical view), a PUT publishes at once: no PR to tell about.
+      const without = buildWikiPromptContext({ contentDir, projectId: 'p1' });
+      expect(without).not.toMatch(/project wiki is Git-tracked/);
+    } finally { fs.rmSync(contentDir, { recursive: true, force: true }); }
+  });
+
   it('inlines the pages a task references in its prompt (`[[proj:…]]`/`[[org:…]]`) in full', () => {
     const contentDir = tmp();
     try {

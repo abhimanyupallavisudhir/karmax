@@ -3807,6 +3807,7 @@ export function makeCoreActivities(deps: CoreActivityDeps) {
           organizationId: (await store.getProject(args.task.projectId))?.organizationId,
           projectId: args.task.projectId,
           projectRoot: wikiSnapshot?.root,
+          projectWikiCheckout: worldRepos(world.handle).find((repo) => repo.role === 'project-wiki')?.root,
           builtinInstructions,
           taggedText,
           contextTokens: Array.isArray(wikiContext) ? wikiContext.map(String) : undefined,
