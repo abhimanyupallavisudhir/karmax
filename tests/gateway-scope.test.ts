@@ -250,6 +250,10 @@ describe('gateway request scope for bare-id routes', () => {
       body: JSON.stringify({ capabilities: [], projectIds, audience: ['@creator'], reason: 'Read phase work.' }) });
     expect((await post([theirs])).status).toBe(400);
     expect((await post('invalid')).status).toBe(400);
+    // Nothing to grant (#1060 was asked to approve "0 permissions"): refused before anyone is asked.
+    const empty = await post([]);
+    expect(empty.status).toBe(400);
+    expect(((await empty.json()) as any).error).toMatch(/capabilities, projectIds, or both/);
     const response = await post([second.id]);
     expect(response.status).toBe(200);
     const requested: any = await response.json();
