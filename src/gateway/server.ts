@@ -785,6 +785,8 @@ const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
 /** A watching socket gets these only for the task it shows (RQ-16)… */
 const WATCHED_TASK_EVENTS = new Set(['agent.output', 'timing']);
 /** …and these only from its own project; lifecycle events still reach inbox and insights. */
+/** The longest an Ask waits for its reply (`waitMs`): a voice assistant's patience. */
+const ASK_REPLY_WAIT_MAX_MS = 10_000;
 const TASK_DETAIL_EVENTS = new Set([...WATCHED_TASK_EVENTS, 'agent.activity', 'conversation.message', 'conversation.explanation']);
 const EXPLANATIONS_OFF = 'Explanations are turned off';
 
@@ -4301,19 +4303,32 @@ export class Gateway {
         const b = await this.body(req);
         const prompt = typeof b.prompt === 'string' ? b.prompt.trim() : '';
         if (!prompt) return this.json(res, 400, { error: 'prompt is required' });
+        // `waitMs`: hold the answer until the agent's reply, for at most that long
+        // (a voice assistant speaks it; wiki features/phone-apps § Siri).
+        if (b.waitMs !== undefined && (typeof b.waitMs !== 'number' || !Number.isFinite(b.waitMs) || b.waitMs < 0))
+          return this.json(res, 400, { error: `waitMs is a number of milliseconds (at most ${ASK_REPLY_WAIT_MAX_MS})` });
+        const waitMs = Math.min(Number(b.waitMs ?? 0), ASK_REPLY_WAIT_MAX_MS);
         // Every organization has one; one older than that gets it now.
         const { project } = await store.ensureOrganizationCoordinatorProject(organizationId);
         await this.wikiForTaskStart(project, callerIdentity.humanSubject?.userId);
         const images = Array.isArray(b.images) ? b.images : undefined, files = Array.isArray(b.files) ? b.files : undefined;
-        if (askTarget(await store.getSettings(`organization:${organizationId}`, ASK_SETTINGS)) === 'ceo') {
-          const ceo = await this.askCeo(token, callerIdentity, project.id, prompt, images, files);
-          // Someone the CEO holds more than asks a quick task of their own instead.
-          if (ceo) return this.json(res, 200, { ...ceo, project, ceo: true });
-        }
-        const task = await api.createTask(token, { projectId: project.id, workflow: 'software-dev', prompt, ownAuthority: true,
-          ...(images ? { images } : {}), ...(files ? { files } : {}),
-          params: { computer: { provider: NO_COMPUTER } } }, receivedAt);
-        return this.json(res, 200, { ...task, project });
+        // Watching starts before the question is sent, so only a reply to it counts.
+        const replies = waitMs > 0 ? await this.watchReplies(organizationId) : undefined;
+        const answer = async (asked: TaskRecord & { awaitingApproval?: unknown }, extra: Record<string, unknown>) => {
+          const reply = replies && !asked.awaitingApproval ? await replies.next(asked.id, waitMs) : undefined;
+          return this.json(res, 200, { ...asked, ...extra, ...(reply ? { reply } : {}) });
+        };
+        try {
+          if (askTarget(await store.getSettings(`organization:${organizationId}`, ASK_SETTINGS)) === 'ceo') {
+            const ceo = await this.askCeo(token, callerIdentity, project.id, prompt, images, files);
+            // Someone the CEO holds more than asks a quick task of their own instead.
+            if (ceo) return await answer(ceo, { project, ceo: true });
+          }
+          const task = await api.createTask(token, { projectId: project.id, workflow: 'software-dev', prompt, ownAuthority: true,
+            ...(images ? { images } : {}), ...(files ? { files } : {}),
+            params: { computer: { provider: NO_COMPUTER } } }, receivedAt);
+          return await answer(task, { project });
+        } finally { replies?.close(); }
       }
       // Where the organization's Ask goes (wiki features/computerless-tasks § Ask).
       const askSettings = p.match(/^\/api\/organizations\/([^/]+)\/ask-settings$/);
@@ -10244,6 +10259,34 @@ export class Gateway {
         audience: [], reason: `Start the CEO, asked: ${prompt.length > 200 ? `${prompt.slice(0, 200)}…` : prompt}` });
       return { ...((await store.getTask(ceo.id)) ?? ceo), awaitingApproval: { requestId: asked.id, audience: asked.audience } };
     }
+  }
+
+  /** Agents' replies (a turn's output) in one organization from now on, so a
+   *  request can wait a bounded time for the reply to what it just asked. */
+  private async watchReplies(organizationId: string): Promise<{ next(taskId: string, ms: number): Promise<string | undefined>; close(): void }> {
+    const outputs = new Map<string, string>();
+    let wake: (() => void) | undefined;
+    // The fan-out may still hold events from before: only later ones are replies.
+    const after = await this.deps.store.latestEventSeq();
+    const close = this.fanout.on((event) => {
+      if (event.type !== 'turn.result' || (event.seq ?? 0) <= after) return;
+      const output = (event.payload as { output?: unknown } | undefined)?.output;
+      if (typeof output !== 'string' || !output.trim()) return;
+      outputs.set(event.taskId, output.trim());
+      wake?.();
+    }, undefined, new Set([organizationId]));
+    return {
+      close,
+      next: async (taskId, ms) => {
+        const deadline = Date.now() + ms;
+        while (!outputs.has(taskId)) {
+          const left = deadline - Date.now();
+          if (left <= 0) return undefined;
+          await new Promise<void>((resolve) => { const timer = setTimeout(resolve, left); wake = () => { clearTimeout(timer); resolve(); }; });
+        }
+        return outputs.get(taskId);
+      },
+    };
   }
 
   /** The project's CEO draft (src/platform/ceo.ts), for the person who made the

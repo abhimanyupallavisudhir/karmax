@@ -6,6 +6,12 @@ A thin [Capacitor 8](https://capacitorjs.com) shell (`io.tavya.app`). Its WebVie
 - **Push**: `Capacitor.Plugins.PushNotifications`, delivered through Firebase Cloud Messaging on both platforms (iOS gets APNs via FCM, so the token the app reports is an FCM token).
 - **Sign-in in the system browser**: `Capacitor.Plugins.TavyaSignIn.open({ url, callbackScheme: 'io.tavya.app' })` resolves `{ url }` with the `io.tavya.app://signed-in?…` callback, or rejects with code `cancelled`. Android uses a Custom Tab (`TavyaSignInPlugin.java`); iOS uses `ASWebAuthenticationSession` (`TavyaSignInPlugin.swift`).
 
+- **Entry points from the phone** (wiki `features/phone-apps` § Entry points). Each becomes a link the console's `openAppLink` handles, handed over by Capacitor's `App` plugin (`appUrlOpen`, kept until the page listens, so a cold start or a sign-in first loses nothing): `io.tavya.app://ask?voice=1`, `io.tavya.app://new`, `io.tavya.app://for-me`, `io.tavya.app://share`, `io.tavya.app://open?path=/…`, and verified `https://tavya.io/…` links.
+  - **Share to tavya**: Android `ACTION_SEND`/`SEND_MULTIPLE` on `MainActivity` (`ShareInbox.java`); iOS the `ShareExtension` target, writing to the app group `group.io.tavya.app` (`Shared/TavyaShared.swift`). The console reads the items through `Capacitor.Plugins.TavyaPhone` (`takeShare`, `readShareFile` in base64 chunks, `finishShare`).
+  - **Siri and Shortcuts** (iOS 16+): `App/TavyaIntents.swift` (Ask, New task, What's for me), calling the API with the device token (`TavyaServer.swift`, `Shared/DeviceToken.swift`).
+  - **Android**: `ACTION_ASSIST` (tavya as the digital-assistant app), the Quick Settings tile (`AskTileService`), the For-me widget (`ForMeWidget`, refreshed by `TavyaPhone.setContext`, by FCM data messages in `TavyaMessagingService` and every 30 min), App Links (`LinkActivity`, excluding `AppLinks.EXCLUDED_PATHS`).
+  - **Device token**: `TavyaSignIn.saveDeviceToken` / `clearDeviceToken`; kept encrypted (Android Keystore, iOS Keychain in the app group's access group) and refreshed one at a time (`TavyaServer`), because it rotates on every use.
+
 The console detects the app with `window.Capacitor?.isNativePlatform?.()` and the `tavya-app` user-agent suffix. If the server can't be reached, the app shows `www/offline.html` (`server.errorPath`).
 
 ## Which server
@@ -33,6 +39,12 @@ cd android && ./gradlew assembleDebug    # app/build/outputs/apk/debug/app-debug
 
 Without `android/app/google-services.json` the app builds and runs, but push is off.
 
+```sh
+cd android && ./gradlew testDebugUnitTest   # JUnit + Robolectric: share inbox, links, widget, device-token rotation
+```
+
+The App Links intent filter claims the host of `TAVYA_URL` (read from the synced `capacitor.config.json`). Verification needs tavya.io's `/.well-known/assetlinks.json`, served once Installation → Phone apps → Links has the signing certificate's SHA-256 (Play Console → App integrity → App signing).
+
 **iOS** needs a Mac with Xcode 26.2 or later (Firebase 13 requires it). The project uses Swift Package Manager, so there is no `pod install` step.
 
 ```sh
@@ -43,6 +55,8 @@ xcodebuild -project ios/App/App.xcodeproj -scheme App -sdk iphonesimulator \
 ```
 
 Push on iOS needs `ios/App/App/Firebase/GoogleService-Info.plist` (git-ignored); without it, registration fails with "Push isn't set up in this build".
+
+The app has two targets: **App** and **ShareExtension** (`io.tavya.app.share`). Both use the App Group `group.io.tavya.app`; App also has Associated Domains (`applinks:tavya.io`, a self-hosted build changes it in `App/App.entitlements`). Universal links work once Installation → Phone apps → Links has the Apple Team ID. Automatic signing registers both bundle IDs and the capabilities; if it does not, add them in Apple Developer → Identifiers.
 
 **Icons and splash screens** are made from `web/brand/royal-gold-arrow/icon.svg`: `node scripts/render-brand-assets.cjs` renders the sources in `assets/`, then `npm run assets` writes the native files.
 

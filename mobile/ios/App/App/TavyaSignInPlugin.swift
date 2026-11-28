@@ -20,7 +20,9 @@ public class TavyaSignInPlugin: CAPPlugin, CAPBridgedPlugin, ASWebAuthentication
     public let identifier = "TavyaSignInPlugin"
     public let jsName = "TavyaSignIn"
     public let pluginMethods: [CAPPluginMethod] = [
-        CAPPluginMethod(name: "open", returnType: CAPPluginReturnPromise)
+        CAPPluginMethod(name: "open", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "saveDeviceToken", returnType: CAPPluginReturnPromise),
+        CAPPluginMethod(name: "clearDeviceToken", returnType: CAPPluginReturnPromise)
     ]
 
     static let callbackScheme = "io.tavya.app"
@@ -63,6 +65,29 @@ public class TavyaSignInPlugin: CAPPlugin, CAPBridgedPlugin, ASWebAuthentication
                 call.reject("Couldn't open the sign-in page", "unavailable")
             }
         }
+    }
+
+    /// The device token for Siri and Shortcuts (wiki planned/native-apps-round-2
+    /// § contracts 3): kept in the Keychain (DeviceToken), used only by
+    /// TavyaServer, never handed back to the page.
+    @objc func saveDeviceToken(_ call: CAPPluginCall) {
+        guard let token = call.getString("token"), token.hasPrefix("tvr_") else {
+            return call.reject("token must be a device token", "invalid")
+        }
+        do {
+            try DeviceToken.withLock { try DeviceToken.save(token) }
+            TavyaServer.shared.forget()
+            call.resolve()
+        } catch {
+            call.reject(error.localizedDescription, "unavailable")
+        }
+    }
+
+    @objc func clearDeviceToken(_ call: CAPPluginCall) {
+        DeviceToken.withLock { DeviceToken.clear() }
+        TavyaServer.shared.forget()
+        PhoneContext.organizationId = nil
+        call.resolve()
     }
 
     public func presentationAnchor(for session: ASWebAuthenticationSession) -> ASPresentationAnchor {

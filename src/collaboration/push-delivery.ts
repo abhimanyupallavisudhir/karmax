@@ -156,7 +156,12 @@ export class PushDeliveryAdapter implements DeliveryAdapter {
         }
         if (device.kind === 'fcm') {
           const { outcome, detail } = await native!.send(device.token, message, PUSH_TTL_SECONDS);
-          if (outcome === 'sent') { delivered++; await store.markPushed(device.id); }
+          if (outcome === 'sent') {
+            delivered++;
+            await store.markPushed(device.id);
+            // Its home-screen widget's count, which an alert alone does not wake the app to update.
+            if (device.platform === 'android') await native!.refresh(device.token).catch(() => undefined);
+          }
           else if (outcome === 'gone') await store.expirePushSubscription(device.id);
           else if (outcome === 'retry') retryable.push(`${device.id}: ${detail}`);
           return;

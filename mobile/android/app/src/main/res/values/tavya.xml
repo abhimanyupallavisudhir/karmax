@@ -4,4 +4,7 @@
     <color name="tavya_notification">#CC9024</color>
     <!-- Brand background, used by the Android 12+ system splash. -->
     <color name="tavya_brand_background">#181220</color>
+    <!-- The widget's text on the brand background. -->
+    <color name="tavya_widget_text">#F4EDE0</color>
+    <color name="tavya_widget_muted">#B8AFC4</color>
 </resources>

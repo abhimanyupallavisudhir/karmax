@@ -4,4 +4,15 @@
     <string name="title_activity_main">tavya</string>
     <string name="package_name">io.tavya.app</string>
     <string name="custom_url_scheme">io.tavya.app</string>
+    <!-- Quick Settings tile, widget (wiki features/phone-apps § Entry points). -->
+    <string name="tile_ask">Ask tavya</string>
+    <string name="widget_name">For me</string>
+    <string name="widget_description">What waits on you, and a mic to ask tavya</string>
+    <string name="widget_for_me">For me</string>
+    <string name="widget_sign_in">Sign in</string>
+    <string name="widget_ask_by_voice">Ask by voice</string>
+    <plurals name="widget_for_me_count">
+        <item quantity="one">%d task for you</item>
+        <item quantity="other">%d tasks for you</item>
+    </plurals>
 </resources>
