@@ -19,6 +19,7 @@ import { ConfigHomeManager } from '../src/autonomy/config-homes.js';
 import { INSTALLATION_SCOPE } from '../src/autonomy/vault-keys.js';
 import { totpCode } from '../src/autonomy/vault-items.js';
 import { EXPLANATIONS_ENABLED } from '../src/config/features.js';
+import { coordinatorRolePrompt } from '../src/domain/coordinator.js';
 
 const webDir = fileURLToPath(new URL('../web', import.meta.url));
 
@@ -1847,9 +1848,9 @@ describe('gateway HTTP API (real server end-to-end)', () => {
       const name = path.includes('/organizations/') ? 'Fresh via organization route' : 'Fresh via legacy route';
       const project: any = await post(path, { name });
       const all: any = await fetch(`${base}/api/projects/${project.id}/tasks`, { headers: auth() }).then((r) => r.json());
-      // Every project also has its CEO, a draft with nothing in it yet (wiki features/coordinator § CEOs).
+      // Every project also has its CEO, a draft whose prompt is its role (wiki features/coordinator § Role prompt).
       expect(all.filter((task: any) => task.params?.coordinator).map((task: any) => ({ title: task.title, draft: task.params.draft, prompt: task.params.prompt })))
-        .toEqual([{ title: 'CEO (Project Co-ordinator)', draft: true, prompt: '' }]);
+        .toEqual([{ title: 'CEO (Project Co-ordinator)', draft: true, prompt: coordinatorRolePrompt('project') }]);
       const tasks = all.filter((task: any) => !task.params?.coordinator);
       expect(tasks.map((task: any) => ({ title: task.title, template: task.params?.template, armed: task.params?.triggerState,
         confirm: task.params?.confirm })), `new project via ${path}`)

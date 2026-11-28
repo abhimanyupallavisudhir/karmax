@@ -617,8 +617,10 @@ async function main() {
   // Every organization has a CEO project, and every project a CEO (src/platform/ceo.ts);
   // those made before that get theirs here.
   startupJobs.push(async () => {
-    const { ensureEveryCeo } = await import('./platform/ceo.js');
+    const { ensureEveryCeo, refreshCoordinatorPrompts } = await import('./platform/ceo.js');
     await ensureEveryCeo({ api, store, tokens });
+    // Role prompts nobody edited take the current role text (wiki features/coordinator § Role prompt).
+    await refreshCoordinatorPrompts(store);
   });
   // Every organization's wiki is a Git repository, published where tavya hosts repositories.
   startupJobs.push(async () => {

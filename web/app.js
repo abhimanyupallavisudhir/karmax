@@ -11280,6 +11280,7 @@ async function openTaskForm(workflow, draft, seedText, seedParams, opts) {
   const submitCommitted = async (draftMode) => (await commitAvatar()) && submit(draftMode);
   $('#tf-save-avatar')?.addEventListener('click', () => submitCommitted(true));
   wireCoordinatorSection(root);
+  wireRolePrompt(root, projectId, draft);
   $('#tf-draft')?.addEventListener('click', () => submitCommitted(true));
   $('#tf-queue').addEventListener('click', () => submitCommitted(false));
   // A repeatable store task installs; unticked, it runs once.
@@ -14682,6 +14683,21 @@ function stagingProgress() {
     title: p.count > 1 ? `Resource ${p.index + 1} of ${p.count}` : '' };
 }
 
+// A co-ordinator's first message is its prompt as stored now (wiki
+// features/coordinator § Role prompt): a role prompt nobody edited shows the
+// role text its turns now read, and one started before the role was its prompt
+// shows the role above what it started with.
+function withRolePrompt(t, messages) {
+  if (t.role !== 'do' || t.from > 0) return messages;
+  const rec = taskRecord(S.view?.taskId);
+  const marker = rec?.params?._rolePrompt;
+  const prompt = rec?.params?.coordinator && marker ? String(rec.params.prompt || '') : '';
+  if (!prompt.trim()) return messages;
+  if (marker.outsideConversation)
+    return [{ id: 'role-prompt', role: 'user', text: prompt, ts: Number(rec.createdAt) || 0 }, ...messages];
+  return messages.map((message) => (message.id === 'm0' ? { ...message, text: prompt } : message));
+}
+
 function conversationEntries(t, events = S.taskEvents) {
   // Fetch/WS races can merge an older durable window with newer events in either
   // array order. Fold provider updates in their durable order so a stale
@@ -14796,7 +14812,7 @@ function conversationEntries(t, events = S.taskEvents) {
   // The provider item a transcript reply stands for is the turn's final answer
   // (what the agent said when its turn ended), not narration on the way.
   const answer = (entry) => { if (entry) entry.answer = true; return false; };
-  const messages = (t.messages || [])
+  const messages = withRolePrompt(t, t.messages || [])
     .filter((message) => {
       if (message.role !== 'agent') return true;
       const source = message.sourceActivity;
@@ -20269,6 +20285,55 @@ function wireCoordinatorSection(root) {
   };
   box.addEventListener('change', apply);
   apply();
+}
+// A co-ordinator's prompt is its role (wiki features/coordinator § Role prompt):
+// ticking the box puts it in the prompt — above anything written there —
+// unticking takes it back out while it is unchanged, and a prompt that differs
+// from it offers a quiet Reset.
+const ROLE_RESET_TIP = 'Use the standard co-ordinator role again. Left as it is, it keeps up with improvements to it.';
+function wireRolePrompt(root, projectId, draft) {
+  const box = root?.querySelector('#tf-coordinator');
+  const prompt = root?.querySelector('.prompt-field textarea[data-field]');
+  const labels = prompt?.closest('.form-row')?.querySelector('.label-row');
+  if (!labels || (!box && !draft?.params?.coordinator)) return;
+  labels.querySelector('.label-row-fill')?.insertAdjacentHTML('afterend',
+    `<button type="button" class="field-reset" id="tf-role-reset" hidden title="${esc(ROLE_RESET_TIP)}">↺ Reset to default</button>`);
+  const reset = labels.querySelector('#tf-role-reset');
+  let role = null;
+  const load = () => role || (role = api(`/api/projects/${encodeURIComponent(projectId)}/coordinator-role${draft?.id ? `?taskId=${encodeURIComponent(draft.id)}` : ''}`)
+    .catch(() => { role = null; return null; }));
+  const coordinator = () => (box ? box.checked : true);
+  // While it is a co-ordinator, its prompt's default is its role, not the inherited empty prompt.
+  const shadow = () => labels.querySelectorAll('.field-reset:not(#tf-role-reset)')
+    .forEach((button) => button.toggleAttribute('data-role-shadowed', coordinator()));
+  const sync = async () => {
+    shadow();
+    const known = await load();
+    reset.hidden = !(known && coordinator() && prompt.value.trim() !== known.prompt.trim());
+  };
+  const write = (text) => {
+    prompt.value = text;
+    prompt.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+  box?.addEventListener('change', async () => {
+    const known = await load();
+    if (!known) return;
+    const role = known.prompt.trim(), text = prompt.value.trim();
+    if (box.checked && !text) write(known.prompt);
+    else if (box.checked && !text.includes(role)) write(`${known.prompt}\n\n${prompt.value}`);
+    else if (!box.checked && text === role) write('');
+    else if (!box.checked && text.startsWith(`${role}\n\n`)) write(text.slice(role.length).trimStart());
+    sync();
+  });
+  reset.addEventListener('click', async () => {
+    const known = await load();
+    if (!known) return;
+    write(known.prompt);
+    reset.hidden = true;
+    prompt.focus();
+  });
+  prompt.addEventListener('input', () => { if (role) sync(); });
+  if (coordinator()) sync();
 }
 // The Parameters tab's row: the interval, changeable all the task's life.
 function coordinatorParamRow(field, value, editable, frozenLabel) {

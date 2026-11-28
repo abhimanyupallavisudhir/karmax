@@ -3,7 +3,8 @@ import path from 'node:path';
 import { assemblePrompt } from '../src/agent/prompt.js';
 import type { AgentProfile, TaskInput } from '../src/domain/types.js';
 import { coordinatorSetting, normalizeCoordinatorSetting, coordinatorCheckIn, coordinatorRetryMinutes, wakeIntervalText,
-  DEFAULT_COORDINATOR_WAKE_HOURS } from '../src/domain/coordinator.js';
+  DEFAULT_COORDINATOR_WAKE_HOURS, coordinatorRolePrompt, rolePromptMarkerFor, rolePromptHash, untouchedRolePrompt, refreshedRolePrompt,
+  coordinatorTurnPrompt, ROLE_PROMPT_PARAM, COORDINATOR_ROLE_VERSION } from '../src/domain/coordinator.js';
 import { storeBackends } from './helpers/store-backends.js';
 
 /**
@@ -58,28 +59,80 @@ describe('the co-ordinator brief', () => {
   const task = (extra: Partial<TaskInput>): TaskInput => ({
     taskId: 'task', projectId: 'project', title: 'Run the firm', prompt: 'Grow the product', project: {}, ...extra });
 
-  it('tells its Do agent it runs the project like a CEO, rests, and is woken within its interval', () => {
+  it('tells its Do agent only what the platform keeps current: rest, wake within its interval, asking, its PRs', () => {
     const prompt = assemblePrompt({ profile, role: 'do', task: task({ coordinator: { wakeHours: 6 } }), world });
-    expect(prompt).toContain('# Your role: permanent co-ordinator');
-    expect(prompt).toContain('CEO');
-    expect(prompt).toContain('create_task');
+    expect(prompt).toContain('# Permanent co-ordinator');
     expect(prompt).toContain('wakes you again within 6 hours to check in');
     expect(prompt).toContain('This task never finishes');
+    expect(prompt).toContain('use escalate_to_human (or pause with needs_input)');
     expect(prompt).toContain('open_pr() one for every branch with new work; neither ends this task.');
+    // The role and judgment are its prompt, which people see and edit.
+    expect(prompt).not.toContain('So don\'t make changes yourself.');
+    expect(prompt).toContain('Grow the product');
   });
 
-  it('tells it to run forever, so never to ship a change that only works once its own work is merged, deployed or restarted', () => {
-    const prompt = assemblePrompt({ profile, role: 'do', task: task({ coordinator: { wakeHours: 6 } }), world });
-    expect(prompt).toContain('Your purpose is to run for as long as the project exists, without stopping');
-    expect(prompt).toContain('So don\'t make changes yourself.');
-    expect(prompt).toContain('merged, deployed or this task restarted');
-    expect(prompt).toContain('put every such change in a task you create, and steer it from here');
+  it('keeps the interval in the hidden part, so an edited prompt still hears an interval change', () => {
+    // Someone replaced the role text with their own words.
+    const edited = task({ prompt: 'Only ever look after the docs.', coordinator: { wakeHours: 6 } });
+    expect(assemblePrompt({ profile, role: 'do', task: edited, world })).toContain('within 6 hours');
+    // The interval is edited while it runs: the next turn's brief says the new one.
+    const later = assemblePrompt({ profile, role: 'do', task: { ...edited, coordinator: { wakeHours: 0.5 } }, world });
+    expect(later).toContain('within 30 minutes');
+    expect(later).not.toContain('within 6 hours');
+    expect(later).toContain('Only ever look after the docs.');
+  });
+
+  it('has a role prompt: run the firm through tasks, forever, never shipping changes itself', () => {
+    const role = coordinatorRolePrompt('project');
+    expect(role).toContain('this project\'s CEO');
+    expect(role).toContain('create_task');
+    expect(role).toContain('Your purpose is to run for as long as the project exists, without stopping');
+    expect(role).toContain('So don\'t make changes yourself.');
+    expect(role).toContain('merged, deployed or this task restarted');
+    expect(role).toContain('put every such change in a task you create, and steer it from here');
+    expect(role).toContain('project wiki');
+    // Fixed text only: nothing the platform must keep current.
+    expect(role).not.toMatch(/\d+ hours?|tavya/);
+    expect(coordinatorRolePrompt('organization')).toContain('this organization\'s CEO');
+    expect(coordinatorRolePrompt('autonomous-organization')).toContain('"autonomous": true');
+    expect(coordinatorRolePrompt('organization')).not.toContain('"autonomous": true');
+  });
+
+  it('marks a prompt as the role text only while it is that text, untouched', () => {
+    const role = coordinatorRolePrompt('project');
+    const marker = rolePromptMarkerFor(role)!;
+    expect(marker).toEqual({ kind: 'project', version: COORDINATOR_ROLE_VERSION, hash: rolePromptHash(role) });
+    expect(rolePromptMarkerFor(`${role}\nAlso: be frugal.`)).toBeUndefined();
+    expect(rolePromptMarkerFor('Grow the product')).toBeUndefined();
+    expect(untouchedRolePrompt({ prompt: role, [ROLE_PROMPT_PARAM]: marker })).toBe(true);
+    expect(untouchedRolePrompt({ prompt: `${role}!`, [ROLE_PROMPT_PARAM]: marker })).toBe(false);
+  });
+
+  it('takes newer role text for a prompt nobody edited, never for one someone did', () => {
+    // An older version of the role text, stored as it was made.
+    const old = 'You are this project\'s CEO. (An older wording.)';
+    const stale = { prompt: old, [ROLE_PROMPT_PARAM]: { kind: 'project', version: COORDINATOR_ROLE_VERSION - 1, hash: rolePromptHash(old) } };
+    expect(refreshedRolePrompt(stale)).toEqual({ prompt: coordinatorRolePrompt('project'),
+      marker: { kind: 'project', version: COORDINATOR_ROLE_VERSION, hash: rolePromptHash(coordinatorRolePrompt('project')) } });
+    expect(refreshedRolePrompt({ ...stale, prompt: `${old} Mine now.` })).toBeUndefined();
+    const current = coordinatorRolePrompt('project');
+    expect(refreshedRolePrompt({ prompt: current, [ROLE_PROMPT_PARAM]: rolePromptMarkerFor(current) })).toBeUndefined();
+  });
+
+  it('reads, on each turn, the role prompt as stored now; one started before it, the role then what it started with', () => {
+    const role = coordinatorRolePrompt('project');
+    expect(coordinatorTurnPrompt({ prompt: role, [ROLE_PROMPT_PARAM]: rolePromptMarkerFor(role) }, 'the older role text')).toBe(role);
+    // Edited before it started: what it started with, always.
+    expect(coordinatorTurnPrompt({ prompt: 'Mine' }, 'Mine')).toBe('Mine');
+    const legacy = { prompt: role, [ROLE_PROMPT_PARAM]: { ...rolePromptMarkerFor(role)!, outsideConversation: true } };
+    expect(coordinatorTurnPrompt(legacy, 'Plan the launch')).toBe(`${role}\n\nPlan the launch`);
+    expect(coordinatorTurnPrompt(legacy, '')).toBe(role);
   });
 
   it('is told to no other task, and to none of its other agents', () => {
-    expect(assemblePrompt({ profile, role: 'do', task: task({}), world })).not.toContain('permanent co-ordinator');
+    expect(assemblePrompt({ profile, role: 'do', task: task({}), world })).not.toContain('# Permanent co-ordinator');
     expect(assemblePrompt({ profile: { ...profile, role: 'responder' }, role: 'responder', task: task({ coordinator: { wakeHours: 6 } }), world }))
-      .not.toContain('# Your role: permanent co-ordinator');
+      .not.toContain('# Permanent co-ordinator');
   });
 });
 
@@ -174,6 +227,92 @@ describe('making a permanent co-ordinator', () => {
     await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Fix a bug', params: { multiPr: false } });
     expect(f.started[1].coordinator).toBeUndefined();
     expect(f.started[1].project.multiPr).toBeFalsy();
+  });
+
+  it('starts with its role as its prompt when given none, marked as the untouched role text', async () => {
+    const f = await fixture();
+    const role = coordinatorRolePrompt('project');
+    const draft = await f.api.createTask(f.owner, { projectId: f.project.id, draft: true, params: { coordinator: { wakeHours: 24 } } });
+    expect(draft.params.prompt).toBe(role);
+    expect(draft.params[ROLE_PROMPT_PARAM]).toEqual(rolePromptMarkerFor(role));
+    expect(draft.title).toBe('Permanent co-ordinator');
+    // Started at once: its first message is the role.
+    await f.api.createTask(f.owner, { projectId: f.project.id, params: { coordinator: true } });
+    expect(f.started[0].prompt).toBe(role);
+    // Given a prompt, it is the person's, unmarked; a caller cannot mark it either.
+    const own = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: 'Run the shop', draft: true,
+      params: { coordinator: true, [ROLE_PROMPT_PARAM]: { kind: 'project', version: 1, hash: rolePromptHash('Run the shop') } } });
+    expect(own.params.prompt).toBe('Run the shop');
+    expect(own.params[ROLE_PROMPT_PARAM]).toBeUndefined();
+    // An ordinary task never gets one.
+    const plain = await f.api.createTask(f.owner, { projectId: f.project.id, prompt: role, draft: true });
+    expect(plain.params[ROLE_PROMPT_PARAM]).toBeUndefined();
+  });
+
+  it('loses the mark when someone edits the prompt, and gets it back on Reset to default', async () => {
+    const f = await fixture();
+    const role = coordinatorRolePrompt('project');
+    const draft = await f.api.createTask(f.owner, { projectId: f.project.id, draft: true, params: { coordinator: true } });
+    const edited = await f.api.updateArmedParams(f.owner, draft.id, { prompt: `${role}\n\nBe frugal.` });
+    expect(edited.params[ROLE_PROMPT_PARAM]).toBeUndefined();
+    // Another field saved with the edited prompt keeps it the person's.
+    const saved = await f.api.updateArmedParams(f.owner, draft.id, { coordinator: { wakeHours: 6 } });
+    expect(saved.params.prompt).toBe(`${role}\n\nBe frugal.`);
+    expect(saved.params[ROLE_PROMPT_PARAM]).toBeUndefined();
+    const reset = await f.api.updateArmedParams(f.owner, draft.id, { prompt: role });
+    expect(reset.params[ROLE_PROMPT_PARAM]).toEqual(rolePromptMarkerFor(role));
+    // A full-form save of the untouched draft keeps the mark.
+    const full = await f.api.updateArmedParams(f.owner, draft.id, { prompt: role, coordinator: { wakeHours: 6 } }, { replace: true });
+    expect(full.params[ROLE_PROMPT_PARAM]).toEqual(rolePromptMarkerFor(role));
+  });
+
+  it('refreshes at boot the role prompts nobody edited, started or not, and never an edited one', async () => {
+    const f = await fixture();
+    const { refreshCoordinatorPrompts, ROLE_PROMPT_MIGRATION_KEY } = await import('../src/platform/ceo.js');
+    await f.store.kvSet(ROLE_PROMPT_MIGRATION_KEY, '1');
+    const old = 'You are this project\'s CEO. (The previous wording.)';
+    const stale = { prompt: old, [ROLE_PROMPT_PARAM]: { kind: 'project', version: COORDINATOR_ROLE_VERSION - 1, hash: rolePromptHash(old) } };
+    const make = (params: Record<string, unknown>) => f.store.createTask({ projectId: f.project.id, title: 'CEO', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: '', coordinator: { wakeHours: 24 }, ...params }, createdBy: { kind: 'user', userId: 'owner' } });
+    const draft = await make({ ...stale, draft: true });
+    const running = await make({ ...stale, draft: false });
+    const edited = await make({ ...stale, prompt: `${old} Plus mine.`, draft: true });
+    expect(await refreshCoordinatorPrompts(f.store)).toEqual({ migrated: 0, refreshed: 2 });
+    const role = coordinatorRolePrompt('project');
+    for (const id of [draft.id, running.id]) {
+      const task = (await f.store.getTask(id))!;
+      expect(task.params.prompt).toBe(role);
+      expect(task.params[ROLE_PROMPT_PARAM]).toEqual(rolePromptMarkerFor(role));
+    }
+    expect((await f.store.getTask(edited.id))!.params.prompt).toBe(`${old} Plus mine.`);
+    // Up to date: nothing more to do.
+    expect(await refreshCoordinatorPrompts(f.store)).toEqual({ migrated: 0, refreshed: 0 });
+  });
+
+  it('gives co-ordinators from before the role prompt theirs once, keeping what each was told', async () => {
+    const f = await fixture();
+    const { refreshCoordinatorPrompts } = await import('../src/platform/ceo.js');
+    const make = (params: Record<string, unknown>) => f.store.createTask({ projectId: f.project.id, title: 'CEO', workflow: 'software-dev',
+      workflowVersion: '1.30.0', params: { prompt: '', coordinator: { wakeHours: 24 }, ...params }, createdBy: { kind: 'user', userId: 'owner' } });
+    const blankDraft = await make({ prompt: '', draft: true });
+    const writtenDraft = await make({ prompt: 'Plan the launch', draft: true });
+    const startedBlank = await make({ prompt: '', draft: false });
+    const startedAsked = await make({ prompt: 'Plan the launch', draft: false });
+    expect((await refreshCoordinatorPrompts(f.store)).migrated).toBe(4);
+    const role = coordinatorRolePrompt('project');
+    const read = async (id: string) => (await f.store.getTask(id))!.params;
+    expect(await read(blankDraft.id)).toMatchObject({ prompt: role, [ROLE_PROMPT_PARAM]: rolePromptMarkerFor(role) });
+    // Someone's words stay theirs, under the role it was told until now.
+    expect((await read(writtenDraft.id)).prompt).toBe(`${role}\n\nPlan the launch`);
+    expect((await read(writtenDraft.id))[ROLE_PROMPT_PARAM]).toBeUndefined();
+    // Started: the role is shown, and its turns read what they read before.
+    for (const [task, started] of [[startedBlank, ''], [startedAsked, 'Plan the launch']] as const) {
+      const params = await read(task.id);
+      expect(params).toMatchObject({ prompt: role, [ROLE_PROMPT_PARAM]: { ...rolePromptMarkerFor(role), outsideConversation: true } });
+      expect(coordinatorTurnPrompt(params, started)).toBe(started ? `${role}\n\n${started}` : role);
+    }
+    // Once only.
+    expect(await refreshCoordinatorPrompts(f.store)).toEqual({ migrated: 0, refreshed: 0 });
   });
 
   it('refuses an interval out of range, a repeatable co-ordinator and another workflow', async () => {

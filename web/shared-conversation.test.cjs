@@ -42,7 +42,7 @@ global.S = {
 };
 global.ICON = { stop: '<svg></svg>' };
 for (const fn of ['defaultRecipientFor', 'sharedConversation', 'participantLabelOf', 'messageOrigin', 'messageSpeaker', 'recipientLabel', 'recipientsHtml', 'composeRecipients',
-  'nextAgentKeyFor', 'locateMentions', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'formEntryKey', 'formContext', 'renderConversationEntry',
+  'nextAgentKeyFor', 'locateMentions', 'taskTranscripts', 'conversationTextKey', 'conversationEntries', 'withRolePrompt', 'taskRecord', 'formEntryKey', 'formContext', 'renderConversationEntry',
   'activeAgentsHtml', 'waitingText', 'waitingLabel', 'accountWaitReason', 'stoppableAgent', 'stopAgentButton', 'conversationPresence']) eval(extractFn(fn));
 
 const view = {

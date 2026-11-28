@@ -64,7 +64,8 @@ import { ANY_PROVIDER, applyComputer, assertInFlightComputerEdit, computerOf, co
   type ComputerSpec, type MachineShape, worldMachine, LOCAL_WORLD_KINDS, runsOnHost } from '../domain/computer.js';
 import { resolveParamsLayers, assembleTaskInput, projectSettingsFor, globalSettingsFor, effectiveRepos, ValueMap } from './params.js';
 import { splitSharedSettings } from '../domain/shared-settings.js';
-import { coordinatorRetryMinutes, coordinatorSetting, normalizeCoordinatorSetting } from '../domain/coordinator.js';
+import { coordinatorRetryMinutes, coordinatorSetting, normalizeCoordinatorSetting, coordinatorRolePrompt, rolePromptMarkerFor,
+  readRolePromptMarker, ROLE_PROMPT_PARAM, type RolePromptMarker } from '../domain/coordinator.js';
 import { REPOSITORY_BRANCHES_RESOLVED_PARAM, applyRepoBranches, normalizeRepoBranches, repositoryBranchDefaults } from './branch-defaults.js';
 import { withTimeout } from '../util/timeout.js';
 import path from 'node:path';
@@ -511,6 +512,22 @@ function assertCoordinatorSetting(params: Record<string, unknown>, workflow: str
   if (parentTaskId) throw new ValidationError("A sub-task can't be a permanent co-ordinator");
   if (params.repeatable === true) throw new ValidationError("A repeatable task can't be a permanent co-ordinator: it never finishes");
   params.multiPr = true;
+}
+
+/** A co-ordinator given no prompt starts with the role text for where it is:
+ * an organization's (the CEO project) or a project's. A prompt it was given is
+ * its creator's choice, kept as it is. */
+function fillCoordinatorRole(params: Record<string, unknown>, project: Pick<Project, 'coordinator'>): void {
+  if (coordinatorSetting(params) && !String(params.prompt ?? '').trim())
+    params.prompt = coordinatorRolePrompt(project.coordinator ? 'organization' : 'project');
+}
+
+/** Which default role text a co-ordinator's prompt is, if it is one untouched
+ * (`params._rolePrompt`, platform metadata, recomputed on every write: a caller
+ * never sets it). `previous` is the marker the task had. */
+function coordinatorRoleMarker(params: Record<string, unknown>, prompt: string, previous?: unknown): RolePromptMarker | undefined {
+  if (!coordinatorSetting(params)) return undefined;
+  return rolePromptMarkerFor(prompt, readRolePromptMarker({ [ROLE_PROMPT_PARAM]: previous }));
 }
 
 /** A permanent co-ordinator's run: it knows it is one, and its own work always
@@ -1764,6 +1781,9 @@ export class KarmaxApi {
     for (const [k, v] of Object.entries({ prompt: args.prompt, base: args.base, target: args.target, command: args.command, branch: args.branch })) {
       if (v !== undefined && taskOverrides[k] === undefined) taskOverrides[k] = v;
     }
+    // A permanent co-ordinator given no prompt starts with its role as its
+    // prompt, shown and editable like any (wiki features/coordinator § Role prompt).
+    fillCoordinatorRole(taskOverrides, project);
     // Image attachments ride alongside the prompt but aren't a manifest param, so
     // carry them explicitly (references only — bytes live in the attachment store).
     if (args.images?.length && taskOverrides.images === undefined) taskOverrides.images = args.images;
@@ -1828,7 +1848,8 @@ export class KarmaxApi {
     // effective list the world will. An empty list is a supported zero-repo run.
     if (!args.draft) (await this.assertRepositoriesValid(manifest, project, resolved));
 
-    const title = args.title?.trim() || derivedTaskTitle(resolved);
+    const title = args.title?.trim() || derivedTaskTitle({ ...resolved, coordinator: taskOverrides.coordinator });
+    const rolePrompt = coordinatorRoleMarker(taskOverrides, String(taskOverrides.prompt ?? resolved.prompt ?? ''));
     const createdBy = args.createdBy ?? (await this.taskCreator(caller, project.id));
     const createdVia = await this.creationCredential(caller);
     // Pin the connected account when the task is created. Switching the user's
@@ -1885,6 +1906,7 @@ export class KarmaxApi {
             ...(limited ? { attenuationAccepted: acceptsTaskAttenuation } : {}) },
           ...(githubAccountId ? { _githubAccountId: githubAccountId } : {}),
           ...(internal.avatarRole ? { _avatarRole: internal.avatarRole } : {}),
+          ...(rolePrompt ? { [ROLE_PROMPT_PARAM]: rolePrompt } : {}),
           ...(repeatable ? { repeatable: true } : {}),
         },
         confirmer: (() => {
@@ -4143,6 +4165,9 @@ export class KarmaxApi {
     const base: Record<string, unknown> = opts.replace ? { ...meta, ...params } : { ...task.params, ...params };
     if (project) (await this.assertAvatarSetting(caller, project, base, taskId));
     assertCoordinatorSetting(base, task.workflow, task.parentTaskId);
+    // Still the platform's role text, or now someone's own (wiki features/coordinator § Role prompt).
+    const rolePrompt = !task.parentTaskId ? coordinatorRoleMarker(base, String(base.prompt ?? ''), task.params?.[ROLE_PROMPT_PARAM]) : undefined;
+    if (rolePrompt) base[ROLE_PROMPT_PARAM] = rolePrompt; else delete base[ROLE_PROMPT_PARAM];
     // Validate the edited triggers before anything is written: a rejected edit
     // (a cycle, a dangling or self dependency) must leave the task as it was,
     // still armed. Saving first left it un-armed with the bad triggers stored,
@@ -7568,6 +7593,39 @@ When ready, call platform_request POST /api/tasks/${task.id}/messages with {"tex
     const message = await this.deliverSignal('message_agent', token, taskId, SIG.followUp, text, role,
       undefined, undefined, undefined, undefined, from);
     return message ? { message } : {};
+  }
+
+  /** A follow-up signed by whoever sends it (a person by name): the Ask to a
+   * started CEO (wiki features/coordinator § CEOs). */
+  async followUpAsSender(token: string, taskId: string, text: string, images?: ImageRef[], files?: FileRef[]): Promise<SentMessage | undefined> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const caller = (await this.require(token, 'signal_task', { projectId: task.projectId, taskId }));
+    return this.deliverSignal('signal_task', token, taskId, SIG.followUp, text, undefined, images, files, undefined, undefined,
+      await this.speaker(caller));
+  }
+
+  /**
+   * Keep a person's message for a task that has not started, as its first
+   * follow-up once it runs (wiki features/queued-messages): the Ask to a CEO
+   * not started yet, which the asker starts — or has approved — rather than
+   * writes into. Platform-internal: the caller has authorized the Ask. Only
+   * its sender may take it back.
+   */
+  async keepMessageFor(token: string, taskId: string, input: { text: string; images?: ImageRef[]; files?: FileRef[] }): Promise<SentMessage> {
+    const task = (await this.deps.store.getTask(taskId));
+    if (!task) throw new NotFoundError(`no task ${taskId}`);
+    const sender = (await this.deps.tokens.verify(token));
+    if (!sender) throw new CapabilityError('who sends this message is unknown');
+    if (input.files?.length) (await this.validatePromptFiles(task.projectId, input.files));
+    const message: Message = { id: `u${randomUUID()}`, role: 'user', text: input.text, ts: Date.now(),
+      ...(input.images?.length ? { images: input.images } : {}), ...(input.files?.length ? { files: input.files } : {}),
+      ...(await this.speaker(sender)) };
+    await this.withPendingLock(taskId, async () =>
+      this.writePending(taskId, [...(await this.readPending(taskId)), { message, role: MAIN_AGENT, by: sender.principal }]));
+    // It may have started meanwhile.
+    void this.flushPendingMessages(taskId);
+    return { ...message, queued: true as const };
   }
 
   /** Who says a message from outside a task's own agents: a person by name, or

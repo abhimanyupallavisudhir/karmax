@@ -5197,3 +5197,6 @@ pre.files-term-screen:focus { box-shadow: inset 0 0 0 2px var(--accent-weak); }
   .traffic-stats { gap: 6px 20px; }
   .traffic-stat b { font-size: 18px; }
 }
+
+/* A co-ordinator's prompt resets to its role (web/app.js wireRolePrompt), not to the inherited prompt. */
+.field-reset[data-role-shadowed] { display: none !important; }
