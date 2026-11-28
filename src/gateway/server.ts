@@ -785,9 +785,9 @@ const LIVE_OUTPUT_BUFFER_BYTES = 64 * 1024;
 /** A watching socket gets these only for the task it shows (RQ-16)… */
 const WATCHED_TASK_EVENTS = new Set(['agent.output', 'timing']);
 /** …and these only from its own project; lifecycle events still reach inbox and insights. */
+const TASK_DETAIL_EVENTS = new Set([...WATCHED_TASK_EVENTS, 'agent.activity', 'conversation.message', 'conversation.explanation']);
 /** The longest an Ask waits for its reply (`waitMs`): a voice assistant's patience. */
 const ASK_REPLY_WAIT_MAX_MS = 10_000;
-const TASK_DETAIL_EVENTS = new Set([...WATCHED_TASK_EVENTS, 'agent.activity', 'conversation.message', 'conversation.explanation']);
 const EXPLANATIONS_OFF = 'Explanations are turned off';
 
 const USER_CAPS = ['*'];
@@ -4314,8 +4314,10 @@ export class Gateway {
         const images = Array.isArray(b.images) ? b.images : undefined, files = Array.isArray(b.files) ? b.files : undefined;
         // Watching starts before the question is sent, so only a reply to it counts.
         const replies = waitMs > 0 ? await this.watchReplies(organizationId) : undefined;
+        // Only a quick task's reply is the answer: a CEO may be mid-turn on another
+        // person's message, and its next turn's output would answer that instead.
         const answer = async (asked: TaskRecord & { awaitingApproval?: unknown }, extra: Record<string, unknown>) => {
-          const reply = replies && !asked.awaitingApproval ? await replies.next(asked.id, waitMs) : undefined;
+          const reply = replies && !extra.ceo && !asked.awaitingApproval ? await replies.next(asked.id, waitMs) : undefined;
           return this.json(res, 200, { ...asked, ...extra, ...(reply ? { reply } : {}) });
         };
         try {
